@@ -1,0 +1,29 @@
+# Optional: publishes firestore.rules to your Firebase project whenever the file changes.
+# Setup: repository secret FIREBASE_SERVICE_ACCOUNT (JSON key of a service account with the
+# "Firebase Rules Admin" role) and repository variable FIREBASE_PROJECT_ID.
+# Without them this workflow does nothing — you can paste the rules in the Firebase console instead.
+name: Deploy Firestore rules
+
+on:
+  push:
+    branches: [main]
+    paths: ["firestore.rules", "firebase.json"]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy rules
+        env:
+          SA: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+          PROJECT: ${{ vars.FIREBASE_PROJECT_ID }}
+        run: |
+          if [ -z "$SA" ] || [ -z "$PROJECT" ]; then
+            echo "FIREBASE_SERVICE_ACCOUNT / FIREBASE_PROJECT_ID not set — skipping."
+            exit 0
+          fi
+          echo "$SA" > "$RUNNER_TEMP/sa.json"
+          export GOOGLE_APPLICATION_CREDENTIALS="$RUNNER_TEMP/sa.json"
+          npx -y firebase-tools@latest deploy --only firestore:rules --project "$PROJECT" --non-interactive

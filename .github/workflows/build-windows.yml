@@ -44,6 +44,13 @@ jobs:
           curl -sf http://127.0.0.1:8799/ | grep -q "SIM Desk" || (cat server.log; exit 1)
           taskkill //F //IM python.exe || true
 
+      - name: Firebase config (from repository variable FIREBASE_CONFIG, optional)
+        shell: bash
+        env:
+          FIREBASE_CONFIG: ${{ vars.FIREBASE_CONFIG }}
+        run: |
+          if [ -n "$FIREBASE_CONFIG" ]; then echo "export const firebaseConfig = $FIREBASE_CONFIG;" > web/firebase-config.js; fi
+
       - name: Build SIM-Desk.exe
         run: >
           pyinstaller --noconfirm --onefile --console

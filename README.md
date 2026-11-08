@@ -1,43 +1,74 @@
 # SIM Desk
 
-Modern French/Arabic interface for a SIM top-up shop. It talks to the provider's Telegram bot for you (top-ups, monthly bills, 4G cards) and manages clients, debts, the daily cash register and suppliers.
+French/Arabic shop app for SIM top-ups through a provider's Telegram bot, with clients and debts, a day register, a safe, suppliers and staff accounts. All data lives in **Firebase Firestore**, so every PC and phone in the shop sees the same data in real time.
 
 ## How it fits together
 
 | Part | Where it runs | What it does |
 |---|---|---|
-| **Interface** (`web/`) | GitHub Pages — `https://<user>.github.io/<repo>/` | The screens. Built and published automatically. |
-| **Server** (`app/`, `run.py`) | The shop PC — `SIM-Desk.exe` | Logs into Telegram, talks to the bot, stores all data in `data/`. |
+| **Interface** (`web/`) | GitHub Pages (or any PC) | Login, recharge, clients, registers, safe, users. It talks to Firebase directly. |
+| **Data** | Firebase Auth + Cloud Firestore | Accounts and all records. Money moves run in transactions, and `firestore.rules` enforce the roles. |
+| **Bot bridge** (`SIM-Desk.exe`) | The one shop PC logged into Telegram | Sends the commands to the provider bot and returns its replies. It stores no business data. |
 
-GitHub Pages can only host static files, so the server must keep running on the shop PC. The Pages interface connects to it at `http://localhost:8765` using an **access key** shown in the SIM Desk window.
+### Roles
 
-## GitHub setup (once)
+- **Manager:** everything, including the dashboard, safe, suppliers, users and settings.
+- **Operator:** recharges, clients (no delete, no credit limit changes) and today's day register (open, expenses, close). The operator's screen can face customers:
+  - Before sending, a big confirmation screen shows the number, operator and amount.
+  - Client debts and limits are hidden behind an eye button.
+  - Other numbers are masked.
+  - The provider balance and profits are removed from the bot's replies.
 
-1. Create a new repository on GitHub and upload everything in this folder (keep the `.github` folder).
-2. **Settings → Pages → Build and deployment → Source: GitHub Actions.**
-3. **Settings → Actions → General → Workflow permissions: Read and write.** This lets builds publish releases.
-4. Push to `main`. Two workflows then run automatically:
-   - **Deploy interface to GitHub Pages** publishes `web/` to your Pages URL.
-   - **Build Windows app** builds `SIM-Desk.exe`. Download it from the run's *Artifacts* section in the **Actions** tab.
-5. For a permanent download link, create a tag: **Releases → Draft a new release → tag `v1.0.0` → Publish**. The workflow attaches `SIM-Desk-windows.zip` to that release.
+### Money flow
 
-## Shop PC
+- **Morning:** opening the day register takes the float out of the safe (this can be turned off).
+- **During the day:**
+  - Sales and debt payments go into the day register.
+  - Expenses come out of it.
+- **Closing:** the counted cash is transferred to the safe automatically. Only a manager can reopen a closed day, and reopening cancels that transfer.
+- **Suppliers:** purchases and supplier payments are paid from the safe.
 
-1. Unzip `SIM-Desk-windows.zip` into a folder you keep, e.g. `C:\SIM-Desk`.
-2. Double-click `SIM-Desk.exe`. Windows SmartScreen may warn about an unsigned app: choose **More info → Run anyway**. Allow it in the firewall if asked.
-3. Keep the black window open. It shows the **access key**.
-4. Open your Pages URL. Leave the server as `http://localhost:8765`, enter the key, and click **Connect**. If the browser asks for local network access, click **Allow**.
-5. Link Telegram in **Settings**. See `LISEZ-MOI.md`.
+## Setup (once)
 
-Your data is stored in `data/` next to the `.exe`. Back it up regularly. `data/telegram.session` gives access to the Telegram account, so never upload it or share it.
+### 1. Firebase
 
-> **Phones and other PCs in the shop:** open `http://<shop-PC-IP>:8765` directly. The IP is shown in the SIM Desk window. Browsers block an `https://` Pages site from talking to `http://192.168…` addresses, so the Pages URL only works on the shop PC itself.
+1. Go to [console.firebase.google.com](https://console.firebase.google.com) and click **Add project**. Analytics isn't needed.
+2. **Build → Authentication → Get started → Email/Password → Enable.**
+3. **Build → Firestore Database → Create database → Production mode.** Pick a location close to you, e.g. `europe-west`.
+4. **Firestore → Rules:** paste the content of `firestore.rules`, then **Publish**.
+5. **Project settings → General → Your apps → Web (</>)** → register the app → copy the `firebaseConfig` object.
+6. **Authentication → Settings → Authorized domains:** add `<your-user>.github.io`.
 
-## Running from source
+### 2. GitHub
 
-```
-pip install -r requirements.txt
-python run.py
-```
+1. Upload this folder to a new repository, keeping the `.github` folder.
+2. **Settings → Secrets and variables → Actions → Variables → New variable** named `FIREBASE_CONFIG`. Its value is the config as JSON, for example:
+   `{"apiKey":"AIza…","authDomain":"x.firebaseapp.com","projectId":"x","storageBucket":"x.appspot.com","messagingSenderId":"1","appId":"1:…"}`
+   Alternatively, paste it into `web/firebase-config.js`.
+3. **Settings → Pages → Source: GitHub Actions.**
+4. **Settings → Actions → General → Workflow permissions: Read and write.**
+5. Push to `main`. The site deploys to Pages, and `SIM-Desk.exe` is built and available under **Actions → Artifacts**, or on a release if you tag `v1.0.0`.
+6. *(Optional)* Firestore rules can deploy themselves: add the secret `FIREBASE_SERVICE_ACCOUNT` (a service-account JSON key) and the variable `FIREBASE_PROJECT_ID`.
 
-On Windows, `start.bat` does this for you.
+### 3. First login
+
+1. Open the Pages URL and choose **Première installation ? → Créer le compte**.
+2. Then **Terminer**. That account becomes the **manager**. This only works once; the rules refuse a second setup.
+3. Go to **Utilisateurs** and create the operators' accounts.
+
+### 4. Bot PC
+
+1. Run `SIM-Desk.exe` on the PC that will be logged into Telegram. Keep its window open; it shows the **access key**.
+2. On that PC, sign in as manager and go to **Paramètres → PC du bot**:
+   - Leave the server address as `http://localhost:8765`.
+   - Enter the access key, then **Enregistrer**.
+   - Link Telegram in the card on the right.
+3. Operators automatically receive the address and key with the shop settings.
+
+> The bot bridge is reached at `http://localhost:8765`, so recharges are made from the bot PC itself. Clients, registers and statements work from any device. To recharge from a second PC, set the bot PC's network address (`http://192.168.x.x:8765`, shown in its window) in **Paramètres**, and open SIM Desk on that second PC at that same address rather than from GitHub Pages. Browsers block an `https` page from calling a plain `http` LAN address. If Firebase then refuses to sign in, add that address under **Authentication → Settings → Authorized domains**.
+
+## Development
+
+- No build step: `web/` is plain HTML/CSS/JS modules.
+- `tests/fb-fake.js` is an offline stand-in for the Firebase SDK that mirrors `firestore.rules`. Copy it over `web/fb.js` in a scratch folder to run the interface without Firebase.
+- To run the bridge from source: `pip install -r requirements.txt`, then `python run.py`.

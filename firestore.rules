@@ -1,0 +1,100 @@
+rules_version = '2';
+
+// SIM Desk security rules.
+//   manager  : everything
+//   operator : recharge (sales), clients, today's register (open / expenses / close)
+//   anyone else signed in (no profile, or disabled): nothing
+// Paste this file in Firebase console → Firestore Database → Rules → Publish.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function userDoc() { return /databases/$(database)/documents/users/$(request.auth.uid); }
+    function profile() { return get(userDoc()).data; }
+    function active() { return signedIn() && exists(userDoc()) && profile().active == true; }
+    function manager() { return active() && profile().role == 'manager'; }
+    function staff() { return active() && profile().role in ['manager', 'operator']; }
+    function setupDone() { return exists(/databases/$(database)/documents/meta/setup); }
+    // first run only: the account doing the setup writes its own manager profile in the same batch
+    function claimingSetup() {
+      return signedIn() && !setupDone()
+        && existsAfter(/databases/$(database)/documents/meta/setup)
+        && getAfter(userDoc()).data.role == 'manager';
+    }
+    function num(v) { return v is int || v is float; }
+
+    match /meta/setup {
+      allow read: if signedIn();
+      allow create: if claimingSetup();
+    }
+
+    match /settings/app {
+      allow read: if staff();
+      allow write: if manager();
+      allow create: if claimingSetup();
+    }
+
+    match /users/{uid} {
+      allow read: if manager() || (signedIn() && request.auth.uid == uid);
+      allow create, update: if manager();
+      allow create: if claimingSetup() && request.auth.uid == uid;
+      allow delete: if false;   // disable a user instead (keeps history readable)
+    }
+
+    match /clients/{cid} {
+      allow read: if staff();
+      // operators cannot set or change a client's credit limit
+      allow create: if manager() || (staff() && request.resource.data.credit_limit == null);
+      allow update: if manager()
+        || (staff() && request.resource.data.get('credit_limit', null) == resource.data.get('credit_limit', null));
+      allow delete: if manager();
+
+      match /entries/{eid} {
+        allow read, create: if staff();
+        allow update, delete: if manager();
+      }
+    }
+
+    match /numbers/{number} {
+      allow read, write: if staff();
+    }
+
+    match /sales/{sid} {
+      allow read: if staff();
+      allow create: if staff() && num(request.resource.data.total) && request.resource.data.total > 0
+                    && request.resource.data.by_uid == request.auth.uid;
+      allow update, delete: if manager();
+    }
+
+    match /registers/{day} {
+      allow read: if staff();
+      allow create: if manager() || (staff() && request.resource.data.status == 'open');
+      // an operator works on an open day only (he can close it, not reopen it)
+      allow update: if manager() || (staff() && resource.data.status == 'open');
+      allow delete: if manager();
+
+      match /moves/{mid} {
+        allow read, create: if staff();
+        allow update, delete: if manager();
+      }
+    }
+
+    // The safe: only the manager sees it. An operator can only drop the day's cash in (closing)
+    // or take the morning float out, both tied to a day register.
+    match /safe_moves/{mid} {
+      allow read, update, delete: if manager();
+      allow create: if manager()
+        || (staff() && request.resource.data.category in ['day_close', 'register_float']
+            && request.resource.data.ref_day is string
+            && exists(/databases/$(database)/documents/registers/$(request.resource.data.ref_day))
+               == (request.resource.data.category == 'day_close'));
+    }
+
+    match /suppliers/{sid} {
+      allow read, write: if manager();
+      match /entries/{eid} {
+        allow read, write: if manager();
+      }
+    }
+  }
+}

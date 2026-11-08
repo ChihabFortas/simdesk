@@ -266,3 +266,53 @@ th { color: var(--muted); font-weight: 600; font-size: 12px; }
   .st-table td, .st-table th { padding: 8px; font-size: 13px; }
   #payF { flex-wrap: wrap; }
 }
+
+/* auth */
+body:not(.signed-in) .app { grid-template-columns: minmax(0, 1fr); }
+body:not(.signed-in) .side { display: none; }
+.auth-wrap { min-height: 80vh; display: grid; place-items: center; }
+.auth-card { width: min(420px, 100%); padding: 28px; }
+.auth-card h1 { margin: 6px 0 8px; }
+.auth-brand { display: flex; align-items: center; gap: 10px; margin-bottom: 18px; font-size: 17px; }
+.auth-brand .logo { color: #fff; width: 38px; height: 38px; } .auth-brand .logo svg { width: 22px; height: 22px; }
+.auth-brand .btn { margin-inline-start: auto; }
+.first-run { margin-top: 18px; border-top: 1px solid var(--line); padding-top: 12px; }
+.first-run summary { cursor: pointer; color: var(--muted); font-weight: 600; font-size: 13.5px; }
+/* user chip */
+.user-chip { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: 12px; background: rgba(255,255,255,.06); color: #fff; }
+.user-chip:empty { display: none; }
+.user-chip .grow { flex: 1; min-width: 0; }
+.user-chip .t { font-weight: 650; font-size: 13.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.user-chip .s { font-size: 11.5px; color: var(--side-ink); }
+.avatar.sm { width: 30px; height: 30px; border-radius: 9px; font-size: 12px; background: rgba(124,108,255,.25); color: #fff; }
+.icon-btn { border: 0; background: transparent; color: inherit; cursor: pointer; padding: 6px; border-radius: 8px; display: grid; place-items: center; opacity: .8; }
+.icon-btn:hover { opacity: 1; background: rgba(127,127,127,.15); }
+.icon-btn svg { width: 18px; height: 18px; }
+.icon-btn.eye { color: var(--muted); align-self: center; justify-self: end; }
+.icon-btn.eye.on { color: var(--accent); }
+.masked { letter-spacing: .15em; color: var(--muted); }
+/* customer confirmation */
+.modal-card.confirm { width: min(620px, 100%); }
+.confirm-screen { text-align: center; padding: 10px 6px; }
+.cs-label { color: var(--muted); font-weight: 700; text-transform: uppercase; letter-spacing: .08em; font-size: 13px; }
+.cs-number { font-size: clamp(34px, 8vw, 58px); font-weight: 800; letter-spacing: .04em; margin: 12px 0; color: var(--ink); }
+.cs-meta { display: flex; justify-content: center; align-items: center; gap: 10px; }
+.cs-meta .op-tag { margin: 0; color: #fff; }
+.cs-op { font-weight: 700; font-size: 18px; }
+.cs-amount { font-size: clamp(28px, 6vw, 42px); font-weight: 800; color: var(--accent); margin-top: 14px; }
+.cs-actions { display: flex; gap: 12px; justify-content: center; margin-top: 26px; }
+.cs-actions .btn { padding: 14px 26px; font-size: 16px; }
+.reg-warn { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 16px; }
+.open-card { max-width: 480px; margin-bottom: 16px; }
+@media (max-width: 760px) { .user-chip, .bot-badge { display: none; } }
+@media (max-width: 760px) {
+  .side-foot { display: block !important; position: fixed; top: 8px; inset-inline-end: 8px; z-index: 45; }
+  .side-foot .bot-badge, .side-foot .lang-btn { display: none; }
+  .user-chip { display: flex !important; background: var(--side); padding: 4px 6px; box-shadow: var(--shadow); }
+  .user-chip .grow { display: none; }
+}
+a.btn { text-decoration: none; color: inherit; }
+@media (max-width: 760px) {
+  body.signed-in main { padding-top: 58px; }
+  .toasts { bottom: 84px; inset-inline: 12px; }
+}

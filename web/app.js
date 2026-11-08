@@ -1,7 +1,9 @@
-/* SIM Desk — single-page interface (no build step). */
+/* SIM Desk — interface. Data: Firebase (store.js). Telegram bot: the bridge running on the bot PC. */
+import * as Store from "./store.js";
+
 const S = {
   lang: localStorage.getItem("lang") || "fr",
-  settings: {}, status: {}, clients: [],
+  settings: { ...Store.DEFAULT_SETTINGS }, status: {}, clients: [], user: null, bridgeOk: null, reveal: false,
   rc: { number: "", feed: [], busy: false, batch: [], sale: { description: "", total: "", paid: "", client: null, sim: "" }, lastText: "" },
 };
 const t = (k) => (I18N[S.lang] && I18N[S.lang][k]) || I18N.fr[k] || k;
@@ -12,33 +14,46 @@ const money = (n) => `<span class="num">${Math.round(Number(n) || 0).toLocaleStr
 const hm = (ts) => (ts || "").slice(11, 16);
 const dmy = (ts) => { const d = (ts || "").slice(0, 10).split("-"); return d.length === 3 ? `${d[2]}/${d[1]}` : ""; };
 const initials = (n) => (n || "?").trim().split(/\s+/).map((w) => w[0]).slice(0, 2).join("").toUpperCase();
+const isMgr = () => Store.isManager();
+const fmtNum = (d) => String(d || "").replace(/(\d{2})(?=\d)/g, "$1 ");
+const maskNum = (d) => { d = String(d || ""); return d.length >= 8 ? `${d.slice(0, 4)} •• ${d.slice(-4)}` : d; };
+// operator screens can be seen by customers: amounts are hidden until the operator taps the eye
+const secret = (html) => (isMgr() || S.reveal ? html : `<span class="masked">•••••</span>`);
 
-/* When opened from GitHub Pages, the interface talks to the SIM Desk server running on the shop PC. */
+/* The bot bridge runs on the shop PC logged into Telegram. When this page is served by that PC itself
+   (http://localhost:8765) the bridge is same-origin; on GitHub Pages it is reached at settings.bridge_url. */
 const CFG = window.SIMDESK || {};
-const REMOTE = !!CFG.remote;
-const serverUrl = () => (localStorage.getItem("server") || CFG.server || "http://localhost:8765").trim().replace(/\/+$/, "");
-const accessKey = () => localStorage.getItem("key") || "";
+const bridgeBase = () => (CFG.remote ? (S.settings.bridge_url || "http://localhost:8765") : "").trim().replace(/\/+$/, "");
+const BRIDGE_PATH = /^\/(bot|telegram|bridge|ping)(\/|$)/;
 
-async function api(path, method = "GET", body, quiet) {
-  const headers = { "Content-Type": "application/json" };
-  if (REMOTE) headers["X-SimDesk-Key"] = accessKey();
+async function bridgeCall(path, method, body) {
   let res;
   try {
-    res = await fetch((REMOTE ? serverUrl() : "") + "/api" + path, { method, headers, body: body ? JSON.stringify(body) : undefined });
-  } catch (e) {
-    if (REMOTE && !quiet) showConnect("unreachable");
-    else if (!quiet) toast(t("err_unreachable"), "err");
-    throw new Error("unreachable");
-  }
-  if (res.status === 401 && REMOTE) { if (!quiet) showConnect("bad_key"); throw new Error("bad_key"); }
-  const j = await res.json().catch(() => ({ ok: false, error: "network" }));
-  if (!j.ok) {
-    const [code, arg] = String(j.error).split(":");
-    const known = t("err_" + code) !== "err_" + code;
-    toast(known ? t("err_" + code) + (arg ? " " + arg : "") : j.error, "err");
-    throw new Error(j.error);
-  }
+    res = await fetch(bridgeBase() + "/api" + path, { method, headers: { "Content-Type": "application/json", "X-SimDesk-Key": S.settings.bridge_key || "" },
+                                                      body: body ? JSON.stringify(body) : undefined });
+  } catch { S.bridgeOk = false; renderBotBadge(); throw new Error("bridge_unreachable"); }
+  if (res.status === 401) { S.bridgeOk = false; renderBotBadge(); throw new Error("bridge_key"); }
+  // a bot PC running an older SIM-Desk.exe answers "Not Found" (plain text) for routes it doesn't know
+  if (res.status === 404) throw new Error("bridge_outdated");
+  const j = await res.json().catch(() => ({ ok: false, error: `bridge_http:${res.status}` }));
+  if (S.bridgeOk !== true) { S.bridgeOk = true; renderBotBadge(); }
+  if (!j.ok) throw new Error(j.error);
   return j.data;
+}
+
+async function api(path, method = "GET", body, quiet) {
+  try {
+    if (BRIDGE_PATH.test(path)) return await bridgeCall(path.replace(/^\/bridge(?=\/)/, ""), method, body);
+    return await Store.route(path, method, body || {});
+  } catch (e) {
+    const msg = String(e?.message || e);
+    if (!quiet) {
+      const [code, arg] = msg.split(":");
+      const known = t("err_" + code) !== "err_" + code;
+      toast(known ? t("err_" + code) + (arg ? " " + arg : "") : msg, "err");
+    }
+    throw e;
+  }
 }
 
 function toast(msg, kind = "") {
@@ -48,6 +63,7 @@ function toast(msg, kind = "") {
 }
 function modal(html, size) { const c = $("#modalCard"); c.className = "modal-card " + (size || ""); c.innerHTML = html; $("#modal").classList.remove("hidden"); }
 function closeModal() { $("#modal").classList.add("hidden"); }
+window.closeModal = closeModal;
 $("#modal").addEventListener("mousedown", (e) => { if (e.target.id === "modal") closeModal(); });
 document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeModal(); });
 
@@ -58,39 +74,62 @@ const IC = {
   clients: '<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/>',
   register: '<rect x="2" y="6" width="20" height="14" rx="2"/><path d="M2 10h20M6 15h4"/><path d="M6 6V4h12v2"/>',
   suppliers: '<path d="M1 3h15v13H1z"/><path d="M16 8h4l3 3v5h-7V8z"/><circle cx="5.5" cy="18.5" r="2.5"/><circle cx="18.5" cy="18.5" r="2.5"/>',
+  safe: '<rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="12" cy="12" r="3.5"/><path d="M12 8.5V7M15.5 12H17M7 20v1.5M17 20v1.5"/>',
+  users: '<path d="M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8z"/><path d="M4 21v-1a6 6 0 0 1 6-6h4a6 6 0 0 1 6 6v1"/><path d="m17 3 1.5 1.5L21 2"/>',
+  logout: '<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/>',
+  eye: '<path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>',
   settings: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/>',
 };
 const svg = (k) => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${IC[k]}</svg>`;
-const PAGES = ["recharge", "dashboard", "clients", "register", "suppliers", "settings"];
+const MANAGER_PAGES = ["recharge", "dashboard", "clients", "register", "safe", "suppliers", "users", "settings"];
+const OPERATOR_PAGES = ["recharge", "clients", "register"];
+const pagesFor = () => (isMgr() ? MANAGER_PAGES : OPERATOR_PAGES);
 
 function renderShell() {
   document.documentElement.lang = S.lang;
   document.documentElement.dir = S.lang === "ar" ? "rtl" : "ltr";
+  document.body.classList.toggle("signed-in", !!S.user);
+  document.body.classList.toggle("role-operator", !!S.user && !isMgr());
   $("#langBtn").textContent = S.lang === "ar" ? "Français" : "العربية";
   $("#shopName").textContent = S.settings.shop_name || "SIM Desk";
   const cur = (location.hash.slice(1) || "recharge").split("/")[0];
-  $("#nav").innerHTML = PAGES.map((p) => `<a href="#${p}" class="${p === cur ? "active" : ""}">${svg(p)}<span>${t("nav_" + p)}</span></a>`).join("");
+  $("#nav").innerHTML = S.user ? pagesFor().map((p) => `<a href="#${p}" class="${p === cur ? "active" : ""}">${svg(p)}<span>${t("nav_" + p)}</span></a>`).join("") : "";
+  $("#userChip").innerHTML = S.user ? `<div class="avatar sm">${esc(initials(S.user.name || S.user.email))}</div>
+    <div class="grow"><div class="t">${esc(S.user.name || S.user.email)}</div><div class="s">${t("role_" + S.user.role)}</div></div>
+    <button class="icon-btn" id="logoutBtn" title="${t("logout_app")}">${svg("logout")}</button>` : "";
+  $("#logoutBtn") && ($("#logoutBtn").onclick = async () => { if (confirm(t("logout_app") + " ?")) { await Store.logout(); } });
+  renderBotBadge();
+}
+function renderBotBadge() {
+  const el = $("#botBadge"); if (!el) return;
+  if (!S.user) { el.innerHTML = ""; return; }
   const st = S.status;
-  let cls = "off", label = t("not_linked");
-  if (st.mode === "demo") { cls = "demo"; label = t("demo_badge"); }
-  else if (st.authorized && st.bot_ok) { cls = "on"; label = `${t("bot_ready")} · ${st.bot}`; }
-  else if (st.authorized) { label = t("bot_missing"); }
-  $("#botBadge").innerHTML = `<span class="dot ${cls}"></span><span>${esc(label)}</span>`;
+  let cls = "off", label = t("bridge_off");
+  if (S.bridgeOk) {
+    if (st.mode === "demo") { cls = "demo"; label = t("demo_badge"); }
+    else if (st.authorized && st.bot_ok) { cls = "on"; label = isMgr() ? `${t("bot_ready")} · ${st.bot}` : t("bot_ready"); }
+    else { label = st.authorized ? t("bot_missing") : t("not_linked"); }
+  }
+  if (S.bridgeOutdated) { cls = "off"; label = t("bridge_outdated"); }
+  el.innerHTML = `<span class="dot ${cls}"></span><span>${esc(label)}</span>`;
 }
 $("#langBtn").onclick = () => setLang(S.lang === "ar" ? "fr" : "ar");
-function setLang(l) { S.lang = l; localStorage.setItem("lang", l); route(); }
+function setLang(l) { S.lang = l; localStorage.setItem("lang", l); S.user ? route() : renderAuth(S.authState); }
+window.setLang = setLang;
 
 async function refreshStatus() {
-  try { S.status = await api("/bot/status"); } catch { S.status = {}; }
+  try { S.status = await api("/bot/status", "GET", null, true); } catch { S.status = {}; }
 }
 
 async function route() {
-  if (S.offline) return showConnect("");
-  const page = (location.hash.slice(1) || "recharge").split("/")[0];
+  if (!S.user) return;
+  let page = (location.hash.slice(1) || "recharge").split("/")[0];
+  if (!pagesFor().includes(page)) { if (location.hash && location.hash !== "#recharge") { location.hash = "recharge"; return; } page = "recharge"; }
   renderShell();
   const v = $("#view");
-  const fn = { recharge: pageRecharge, dashboard: pageDashboard, clients: pageClients, register: pageRegister, suppliers: pageSuppliers, settings: pageSettings }[page] || pageRecharge;
-  await fn(v);
+  const fn = { recharge: pageRecharge, dashboard: pageDashboard, clients: pageClients, register: pageRegister, safe: pageSafe,
+               suppliers: pageSuppliers, users: pageUsers, settings: pageSettings }[page] || pageRecharge;
+  try { await fn(v); } catch (e) { console.error(e); }
 }
 window.addEventListener("hashchange", () => { closeModal(); route(); });
 
@@ -144,6 +183,7 @@ async function pageRecharge(v) {
       <div class="feed" id="feed"></div>
     </div>
     <div class="sale-panel">
+      <div id="regBanner"></div>
       <div id="clientBox" class="hidden"></div>
       <div class="card" id="salePanel"></div>
       <div class="card" style="margin-top:16px"><h2>${t("today_ops")}</h2><div class="list" id="todayList"></div></div>
@@ -168,7 +208,7 @@ async function pageRecharge(v) {
   refresh();
   $("#lookupForm").onsubmit = (e) => { e.preventDefault(); sendOperation(); };
   if (!r.feed.length) inp.focus();
-  renderProvider(); renderFeed(); renderClientBox(); renderSalePanel(); loadToday();
+  renderProvider(); renderFeed(); renderClientBox(); renderSalePanel(); loadToday(); checkRegister();
   if (r.number && !r.clientInfo) lookupClientByNumber(r.number);
   if (!S.menu) loadMenu();
 }
@@ -187,8 +227,34 @@ async function sendOperation() {
   };
   r.sale = { ...freshSale(), client: r.sale.client, attach: r.sale.attach, label: r.sale.label, sim: r.pending?.sim || num };
   renderSalePanel();
-  await talk(() => api("/bot/topup", "POST", { number: num, operation: r.operation, amount }), cmd);
+  if (!cmd) return toast(t("err_invalid_amount"), "err");
+  if (S.settings.confirm_before_send !== false) {
+    const ok = await confirmForCustomer({ num: r.pending?.sim || num, op, operation: r.operation, amount });
+    if (!ok) { r.pending = null; return; }
+  }
+  await talk(() => api("/bot/send", "POST", { text: cmd }), cmd);
 }
+
+/* Big, readable confirmation the customer checks before the operator sends anything */
+function confirmForCustomer({ num, op, operation, amount }) {
+  return new Promise((resolve) => {
+    modal(`<div class="confirm-screen">
+        <div class="cs-label">${t("confirm_number")}</div>
+        <div class="cs-number num">${esc(fmtNum(num))}</div>
+        <div class="cs-meta"><span class="op-tag op-${op}">${esc(op)}</span><span class="cs-op">${t("op_" + operation)}</span></div>
+        ${amount ? `<div class="cs-amount">${money(amount)}</div>` : ""}
+        <div class="cs-actions"><button class="btn" id="csNo">${t("correct")}</button><button class="btn primary" id="csYes">${t("confirm_send")}</button></div>
+      </div>`, "confirm");
+    const done = (v) => { document.removeEventListener("keydown", key, true); closeModal(); resolve(v); };
+    const key = (e) => { if (e.key === "Enter") { e.preventDefault(); done(true); } if (e.key === "Escape") { e.preventDefault(); done(false); } };
+    document.addEventListener("keydown", key, true);
+    $("#csYes").onclick = () => done(true); $("#csNo").onclick = () => done(false);
+    $("#csYes").focus();
+  });
+}
+// lines of the bot's replies that reveal the shop's own account (balance, profits…) are hidden from operators
+const SENSITIVE_LINE = /رصيد|الارباح|الأرباح|ارباح|أرباح|ديون|solde|balance|profit|bénéfice|commission/i;
+const redact = (text) => (isMgr() ? text : String(text || "").split("\n").filter((l) => !SENSITIVE_LINE.test(l)).join("\n"));
 
 /* the provider account: values come from the bot's own menu labels (رصيد : … دج) */
 async function loadMenu() {
@@ -202,7 +268,14 @@ function menuValue(rx) {
 }
 function renderProvider() {
   const el = $("#provider"); if (!el) return;
-  const btns = (S.menu?.buttons || []).flat();
+  let btns = (S.menu?.buttons || []).flat();
+  if (!isMgr()) {   // operators only get the cards menu; the shop's account stays private
+    btns = btns.filter((b) => /بطاقات|cartes|cards/i.test(b.text));
+    el.innerHTML = `<div class="prov-menu">${btns.map((b) => `<button class="pill-btn" data-r="${b.r}" data-c="${b.c}">${esc(b.text)}</button>`).join("")}</div>`;
+    $$(".pill-btn", el).forEach((b) => b.onclick = () => { S.rc.feed = []; S.rc.pending = null;
+      talk(() => api("/bot/click", "POST", { msg_id: S.menu.msg_id, row: +b.dataset.r, col: +b.dataset.c }), b.textContent); });
+    return;
+  }
   if (!btns.length) { el.innerHTML = `<button class="btn sm ghost" id="menuLoad">↻ ${t("bot_menu")}</button>`; $("#menuLoad").onclick = loadMenu; return; }
   const vals = [["provider_balance", /رصيد/], ["provider_debt", /ديون/], ["provider_profit", /الارباح|الأرباح/]]
     .map(([k, rx]) => [k, menuValue(rx)]).filter(([, v]) => v !== null);
@@ -269,7 +342,7 @@ function classify(text) {
 
 function renderBotCard(m, active) {
   const kind = classify(m.text);
-  const lines = m.text.split("\n").map((l) => l.trim());
+  const lines = redact(m.text).split("\n").map((l) => l.trim());
   let head = "";
   const firstIdx = lines.findIndex((l) => l);
   if (firstIdx >= 0 && !/^[^:：]{1,40}[:：]\s*\S/.test(lines[firstIdx]) && lines[firstIdx].length < 70) { head = lines[firstIdx]; lines.splice(firstIdx, 1); }
@@ -382,16 +455,21 @@ function renderClientBox() {
       <div class="avatar">${esc(initials(c.name))}</div>
       <div class="grow"><div class="t">${esc(c.name)}</div>
         <div class="sub">${c.number_label ? `<span class="pill accent">${esc(c.number_label)}</span> ` : ""}${nums.length} ${t("numbers_count")}</div></div>
+      ${isMgr() ? "" : `<button class="icon-btn eye ${S.reveal ? "on" : ""}" id="revealBtn" title="${t("show_amounts")}">${svg("eye")}</button>`}
       <button class="btn sm" id="cbStatement">${t("statement")}</button>
     </div>
     <div class="cb-status ${st.cls}">${st.cls === "green" ? "✓" : st.cls === "red" ? "⛔" : "!"} ${st.text}</div>
     <div class="cb-grid">
-      <div><span>${t("debt")}</span><b class="${c.debt > 0.001 ? "amt-out" : "amt-in"}">${money(c.debt)}</b></div>
-      <div><span>${t("credit_limit")}</span><b>${c.credit_limit != null ? money(c.credit_limit) : "—"}</b></div>
-      ${st.left !== undefined ? `<div><span>${t("credit_left")}</span><b class="${st.left < 0 ? "amt-out" : ""}">${money(st.left)}</b></div>` : ""}
+      <div><span>${t("debt")}</span><b class="${c.debt > 0.001 ? "amt-out" : "amt-in"}">${secret(money(c.debt))}</b></div>
+      <div><span>${t("credit_limit")}</span><b>${c.credit_limit != null ? secret(money(c.credit_limit)) : "—"}</b></div>
+      ${st.left !== undefined ? `<div><span>${t("credit_left")}</span><b class="${st.left < 0 ? "amt-out" : ""}">${secret(money(st.left))}</b></div>` : ""}
     </div>
-    <div class="cb-nums">${nums.map((x) => `<span class="num-chip ${x.number === here ? "on" : ""}"><i class="opdot op-${opOf(x.number)}"></i><span class="num">${esc(x.number)}</span>${x.label ? ` · ${esc(x.label)}` : ""}</span>`).join("")}</div>`;
+    <div class="cb-nums">${nums.map((x) => x.number === here || isMgr()
+      ? `<span class="num-chip ${x.number === here ? "on" : ""}"><i class="opdot op-${opOf(x.number)}"></i><span class="num">${esc(x.number)}</span>${x.label ? ` · ${esc(x.label)}` : ""}</span>`
+      : `<span class="num-chip"><i class="opdot op-${opOf(x.number)}"></i><span class="num">${esc(maskNum(x.number))}</span></span>`).join("")}</div>`;
   $("#cbStatement").onclick = () => openStatement(c.id);
+  $("#revealBtn") && ($("#revealBtn").onclick = () => { S.reveal = !S.reveal; renderClientBox(); clearTimeout(S.revealTimer);
+    if (S.reveal) S.revealTimer = setTimeout(() => { S.reveal = false; renderClientBox(); }, 8000); });
 }
 
 function freshSale() { return { description: "", total: "", paid: "", client: null, sim: "" }; }
@@ -460,7 +538,7 @@ function bindCombo(root, onPick) {
   const show = async () => {
     S.clients = await api("/clients?q=" + encodeURIComponent(inp.value.trim()));
     const q = inp.value.trim();
-    list.innerHTML = `<div data-id="">${t("walk_in")}</div>` + S.clients.slice(0, 30).map((c) => `<div data-id="${c.id}"><span>${esc(c.name)} <span class="sub num">${esc((c.numbers || [])[0] || c.phone || "")}${(c.numbers || []).length > 1 ? ` +${c.numbers.length - 1}` : ""}</span></span>${c.debt > 0 ? `<span class="pill red">${money(c.debt)}</span>` : ""}</div>`).join("")
+    list.innerHTML = `<div data-id="">${t("walk_in")}</div>` + S.clients.slice(0, 30).map((c) => `<div data-id="${c.id}"><span>${esc(c.name)} <span class="sub num">${esc((c.numbers || [])[0] || c.phone || "")}${(c.numbers || []).length > 1 ? ` +${c.numbers.length - 1}` : ""}</span></span>${c.debt > 0 ? `<span class="pill red">${secret(money(c.debt))}</span>` : ""}</div>`).join("")
       + (q ? `<div data-new="1">+ ${t("new_client")} : <b>${esc(q)}</b></div>` : "");
     list.classList.remove("hidden");
   };
@@ -480,6 +558,14 @@ function bindCombo(root, onPick) {
   };
 }
 
+async function checkRegister() {
+  try {
+    const reg = await api("/register", "GET", null, true);
+    const el = $("#regBanner"); if (!el) return;
+    el.innerHTML = reg.status === "open" ? "" : `<div class="notice reg-warn">${reg.status === "closed" ? t("register_is_closed") : t("register_not_open")}
+      <a class="btn sm" href="#register">${t("nav_register")}</a></div>`;
+  } catch {}
+}
 async function loadToday() {
   const el = $("#todayList"); if (!el) return;
   const today = new Date().toLocaleDateString("sv-SE");
@@ -489,9 +575,10 @@ async function loadToday() {
 }
 function saleItem(s) {
   const debt = s.total - s.paid;
+  const who = isMgr() ? `${esc(s.client_name || t("walkin_short"))}${s.by_name ? ` · ${esc(s.by_name)}` : ""}` : (s.client_id ? t("client") : t("walkin_short"));
   return `<div class="item"><div class="grow"><div class="t">${esc(s.description || s.kind || t("sale"))}</div>
-    <div class="s"><span class="num">${esc(s.sim_number)}</span> · ${esc(s.client_name || t("walkin_short"))} · ${hm(s.ts)}</div></div>
-    <div style="text-align:end">${money(s.total)}${debt > 0.001 ? `<div><span class="pill red">${money(debt)}</span></div>` : ""}</div></div>`;
+    <div class="s"><span class="num">${esc(isMgr() ? s.sim_number : maskNum(s.sim_number))}</span> · ${who} · ${hm(s.ts)}</div></div>
+    <div style="text-align:end">${money(s.total)}${debt > 0.001 ? `<div><span class="pill red">${secret(money(debt))}</span></div>` : ""}</div></div>`;
 }
 
 /* ---------------- DASHBOARD ---------------- */
@@ -507,6 +594,7 @@ async function pageDashboard(v) {
     <div class="kpi"><div class="l">${t("kpi_out")}</div><div class="v amt-out">${money(d.total_out)}</div></div>
     <div class="kpi"><div class="l">${t("kpi_debts")}</div><div class="v">${money(d.clients_debt)}</div></div>
     <div class="kpi"><div class="l">${t("kpi_owed")}</div><div class="v">${money(d.suppliers_owed)}</div></div>
+    <div class="kpi"><div class="l">${t("safe_balance")}</div><div class="v">${money(d.safe_balance)}</div></div>
   </div>
   <div class="grid g2">
     <div class="card"><h2>${t("week")}</h2>
@@ -517,11 +605,11 @@ async function pageDashboard(v) {
         : `<div class="empty">${t("nothing")}</div>`}
     </div>
     <div class="card"><h2>${t("top_debtors")}</h2><div class="list">
-      ${d.top_debtors.length ? d.top_debtors.map((c) => `<div class="item click" data-c="${c.id}"><div class="avatar">${esc(initials(c.name))}</div><div class="grow"><div class="t">${esc(c.name)}</div><div class="s num">${esc(c.phone)}</div></div><span class="pill red">${money(c.debt)}</span></div>`).join("") : `<div class="empty">${t("nothing")}</div>`}
+      ${d.top_debtors.length ? d.top_debtors.map((c) => `<div class="item click" data-c="${c.id}"><div class="avatar">${esc(initials(c.name))}</div><div class="grow"><div class="t">${esc(c.name)}</div><div class="s num">${esc((c.numbers || [])[0] || c.phone || "")}</div></div><span class="pill red">${money(c.debt)}</span></div>`).join("") : `<div class="empty">${t("nothing")}</div>`}
     </div></div>
   </div>
   <div class="card" style="margin-top:16px"><h2>${t("recent")}</h2><div class="list">${d.recent_sales.length ? d.recent_sales.map(saleItem).join("") : `<div class="empty">${t("nothing")}</div>`}</div></div>`;
-  $$("[data-c]", v).forEach((el) => el.onclick = () => openClient(+el.dataset.c));
+  $$("[data-c]", v).forEach((el) => el.onclick = () => openClient(el.dataset.c));
 }
 
 /* ---------------- CLIENTS ---------------- */
@@ -542,7 +630,7 @@ async function pageClients(v) {
       <div class="grow"><div class="t">${esc(c.name)}</div><div class="s"><span class="num">${esc(c.numbers[0] || c.phone || "")}</span>${c.numbers.length > 1 ? ` <span class="pill">+${c.numbers.length - 1} ${t("lines_short")}</span>` : ""}${c.last_sale ? ` · ${dmy(c.last_sale)}` : ""}</div></div>
       ${c.credit_limit != null && c.debt > c.credit_limit ? `<span class="pill red">⛔</span>` : ""}
       ${c.debt > 0.001 ? `<span class="pill red">${money(c.debt)}</span>` : `<span class="pill green">${t("clear")}</span>`}</div>`).join("") : `<div class="empty">${t("nothing")}</div>`;
-    $$("[data-c]", v).forEach((el) => el.onclick = () => openClient(+el.dataset.c, load));
+    $$("[data-c]", v).forEach((el) => el.onclick = () => openClient(el.dataset.c, load));
   };
   $("#cq").oninput = load;
   $("#cNew").onclick = () => editClient(null, load);
@@ -573,7 +661,7 @@ function editClient(obj, done) {
     <form id="pf">
       <div class="row"><div class="field"><label>${t("name")}</label><input class="input" name="name" required value="${esc(o.name)}"></div>
         <div class="field"><label>${t("phone")}</label><input class="input num" name="phone" value="${esc(o.phone)}"></div></div>
-      <div class="field"><label>${t("credit_limit")}</label><input class="input num" name="credit_limit" inputmode="numeric" placeholder="${t("no_limit")}" value="${o.credit_limit ?? ""}">
+      <div class="field"><label>${t("credit_limit")}</label><input class="input num" name="credit_limit" inputmode="numeric" placeholder="${t("no_limit")}" value="${o.credit_limit ?? ""}" ${isMgr() ? "" : "disabled"}>
         <span class="sub">${t("credit_limit_hint")}</span></div>
       <div class="field"><label>${t("lines")}</label><div id="numList" class="num-list"></div>
         <div class="row" style="margin-top:8px"><input class="input num" id="nNum" inputmode="tel" placeholder="06 XX XX XX XX"><input class="input" id="nLabel" placeholder="${t("number_label_ph")}">
@@ -604,6 +692,7 @@ function editClient(obj, done) {
   $("#pf").onsubmit = async (e) => {
     e.preventDefault();
     const data = Object.fromEntries(new FormData(e.target));
+    if (!isMgr()) delete data.credit_limit;
     if (!o.id) data.numbers = nums;
     const res = await api("/clients" + (o.id ? `/${o.id}` : ""), o.id ? "PUT" : "POST", data);
     toast(t("saved"), "ok"); closeModal(); done && done(res.id);
@@ -627,7 +716,7 @@ async function openStatement(id, onChange, f) {
       <div class="row no-print" style="flex:none">
         <button class="btn sm" id="stEdit">${t("edit")}</button>
         <button class="btn sm" onclick="window.print()">${t("print")}</button>
-        <button class="btn sm red" id="stDel">${t("delete")}</button>
+        ${isMgr() ? `<button class="btn sm red" id="stDel">${t("delete")}</button>` : ""}
         <button class="btn ghost" onclick="closeModal()">✕</button></div>
     </div>
     <div class="cb-nums" style="margin-bottom:14px">${st.numbers.map((n) => `<span class="num-chip"><i class="opdot op-${n.operator}"></i><span class="num">${esc(n.number)}</span>${n.label ? ` · ${esc(n.label)}` : ""}</span>`).join("") || `<span class="sub">${t("no_lines")}</span>`}</div>
@@ -675,14 +764,14 @@ async function openStatement(id, onChange, f) {
     const full = await api("/clients/" + id);
     editClient(full, () => { onChange && onChange(); refreshRechargeClient(); again(); });
   };
-  $("#stDel").onclick = async () => {
+  $("#stDel") && ($("#stDel").onclick = async () => {
     const msg = t("delete_client_confirm").replace("{c}", c.name) + (c.debt > 0.001 ? "\n" + t("delete_client_debt").replace("{d}", Math.round(c.debt)) : "");
     if (!confirm(msg)) return;
     await api(`/clients/${id}/delete`, "POST", {});
     toast(t("deleted"), "ok"); closeModal();
     if (S.rc.clientInfo?.id === id) { S.rc.clientInfo = null; S.rc.sale.client = null; S.rc.autoClient = false; }
     onChange && onChange(); refreshRechargeClient();
-  };
+  });
   $("#payF") && ($("#payF").onsubmit = async (e) => {
     e.preventDefault();
     await api(`/clients/${id}/pay`, "POST", Object.fromEntries(new FormData(e.target)));
@@ -701,58 +790,143 @@ const catLabel = (c) => (t("cat_" + c) !== "cat_" + c ? t("cat_" + c) : t(c));
 
 async function pageRegister(v, day) {
   const today = new Date().toLocaleDateString("sv-SE");
-  day = day || today;
+  day = isMgr() ? (day || today) : today;          // operators only work on today's register
   const r = await api("/register?day=" + day);
   const isToday = day === today;
-  const opened = r.opening !== null && r.opening !== undefined;
+  const open = r.status === "open", closed = r.status === "closed";
   let dir = "out";
+  const cats = isMgr() ? CATS : { in: ["other_in"], out: ["expense", "other"] };
   v.innerHTML = `
-  <div class="page-head"><h1>${t("nav_register")}</h1><input type="date" class="input" id="regDay" value="${day}" max="${today}" style="width:auto"></div>
-  ${!opened && isToday ? `<div class="card" style="max-width:460px;margin-bottom:16px"><h2>${t("register_closed_title")}</h2>
+  <div class="page-head"><h1>${t("day_register")}</h1>
+    ${isMgr() ? `<input type="date" class="input" id="regDay" value="${day}" max="${today}" style="width:auto">` : `<span class="sub">${t("today")} · ${dmy(day)}</span>`}</div>
+  ${r.status === "none" && isToday ? `<div class="card open-card"><h2>${t("register_closed_title")}</h2>
+     <p class="sub">${S.settings.float_from_safe ? t("float_from_safe_hint") : ""}</p>
      <form class="row" id="openF"><input class="input num" name="opening" inputmode="decimal" value="${Math.round(r.suggested_opening || 0)}"><button class="btn primary" style="flex:none">${t("open")}</button></form></div>` : ""}
+  ${r.status === "none" && !isToday ? `<div class="empty card">${t("nothing")}</div>` : ""}
+  ${r.status !== "none" ? `
   <div class="kpis">
     <div class="kpi"><div class="l">${t("opening")}</div><div class="v">${money(r.opening || 0)}</div></div>
     <div class="kpi"><div class="l">${t("kpi_in")}</div><div class="v amt-in">${money(r.total_in)}</div></div>
     <div class="kpi"><div class="l">${t("kpi_out")}</div><div class="v amt-out">${money(r.total_out)}</div></div>
     <div class="kpi accent"><div class="l">${t("expected")}</div><div class="v">${money(r.expected)}</div></div>
-    ${r.closed_at ? `<div class="kpi"><div class="l">${t("counted")}</div><div class="v">${money(r.counted)}</div></div>
+    ${closed ? `<div class="kpi"><div class="l">${t("counted")}</div><div class="v">${money(r.counted)}</div></div>
       <div class="kpi"><div class="l">${t("difference")}</div><div class="v ${Math.abs(r.difference) < 1 ? "amt-in" : "amt-out"}">${r.difference > 0 ? "+" : ""}${money(r.difference)}</div></div>` : ""}
   </div>
   <div class="grid g2">
     <div>
-      ${isToday && !r.closed_at ? `<div class="card" style="margin-bottom:16px"><h2>${t("add_move")}</h2>
+      ${isToday && open ? `<div class="card" style="margin-bottom:16px"><h2>${t("add_move")}</h2>
         <div class="seg" id="dirSeg"><button data-d="in">${t("money_in")}</button><button data-d="out" class="on">${t("money_out")}</button></div>
         <form id="mvF"><div class="row"><div class="field"><label>${t("category")}</label><select class="input" name="category" id="mvCat"></select></div>
           <div class="field"><label>${t("amount")}</label><input class="input num" name="amount" inputmode="decimal" required></div></div>
           <div class="field"><label>${t("note")}</label><input class="input" name="note"></div>
           <button class="btn primary">${t("save")}</button></form></div>
         <div class="card"><h2>${t("close_register")}</h2>
+          <p class="sub">${t("close_to_safe_hint")}</p>
           <form id="closeF"><div class="row"><div class="field"><label>${t("counted")}</label><input class="input num" name="counted" inputmode="decimal" required placeholder="${Math.round(r.expected)}"></div>
           <div class="field"><label>${t("note")}</label><input class="input" name="note"></div></div>
           <button class="btn green">${t("close_register")}</button></form></div>`
-      : r.closed_at ? `<div class="card"><div class="status-box"><span class="dot on"></span>${t("closed")} · ${hm(r.closed_at)}</div>${esc(r.note)} ${isToday ? `<button class="btn sm" id="reopenB">${t("reopen")}</button>` : ""}</div>` : ""}
+      : closed ? `<div class="card"><div class="status-box"><span class="dot on"></span>${t("closed")} · ${hm(r.closed_at)} · ${esc(r.closed_by || "")}</div>
+          <p class="sub">${t("sent_to_safe")} ${money(r.counted)}</p>${esc(r.note)} ${isMgr() ? `<button class="btn sm" id="reopenB">${t("reopen")}</button>` : ""}</div>` : ""}
       <div class="card" style="margin-top:16px"><h2>${t("by_cat")}</h2>
         ${r.by_category.length ? `<table><tbody>${r.by_category.map((c) => `<tr><td>${catLabel(c.category)}</td><td style="text-align:end" class="${c.direction === "in" ? "amt-in" : "amt-out"}">${c.direction === "in" ? "+" : "−"}${money(c.amount)}</td></tr>`).join("")}</tbody></table>` : `<div class="empty">${t("nothing")}</div>`}
         ${r.new_debt > 0 ? `<div class="sub" style="margin-top:10px">${t("rest")} : ${money(r.new_debt)}</div>` : ""}
       </div>
     </div>
     <div class="card"><h2>${t("moves")}</h2><div class="list">
-      ${r.moves.length ? r.moves.map((m) => `<div class="item"><div class="grow"><div class="t">${catLabel(m.category)}</div><div class="s">${hm(m.ts)} · ${esc(m.note)}</div></div>
+      ${r.moves.length ? r.moves.map((m) => `<div class="item"><div class="grow"><div class="t">${catLabel(m.category)}</div><div class="s">${hm(m.ts)} · ${esc(m.note)}${isMgr() && m.by_name ? ` · ${esc(m.by_name)}` : ""}</div></div>
         <span class="${m.direction === "in" ? "amt-in" : "amt-out"}">${m.direction === "in" ? "+" : "−"}${money(m.amount)}</span>
-        ${m.ref_type === "manual" && isToday && !r.closed_at ? `<button class="btn ghost sm" data-del="${m.id}">✕</button>` : ""}</div>`).join("") : `<div class="empty">${t("nothing")}</div>`}
+        ${isMgr() && m.ref_type === "manual" && isToday && open ? `<button class="btn ghost sm" data-del="${m.id}">✕</button>` : ""}</div>`).join("") : `<div class="empty">${t("nothing")}</div>`}
     </div></div>
-  </div>`;
-  $("#regDay").onchange = (e) => pageRegister(v, e.target.value);
-  const fillCats = () => { $("#mvCat").innerHTML = CATS[dir].map((c) => `<option value="${c}">${catLabel(c)}</option>`).join(""); };
+  </div>` : ""}`;
+  $("#regDay") && ($("#regDay").onchange = (e) => pageRegister(v, e.target.value));
+  const fillCats = () => { $("#mvCat").innerHTML = cats[dir].map((c) => `<option value="${c}">${catLabel(c)}</option>`).join(""); };
   if ($("#mvCat")) {
     fillCats();
     $$("#dirSeg button").forEach((b) => b.onclick = () => { dir = b.dataset.d; $$("#dirSeg button").forEach((x) => x.classList.toggle("on", x === b)); fillCats(); });
     $("#mvF").onsubmit = async (e) => { e.preventDefault(); await api("/register/move", "POST", { ...Object.fromEntries(new FormData(e.target)), direction: dir }); toast(t("saved"), "ok"); pageRegister(v, day); };
-    $("#closeF").onsubmit = async (e) => { e.preventDefault(); await api("/register/close", "POST", Object.fromEntries(new FormData(e.target))); pageRegister(v, day); };
+    $("#closeF").onsubmit = async (e) => {
+      e.preventDefault();
+      const d = Object.fromEntries(new FormData(e.target));
+      if (!confirm(t("close_confirm").replace("{a}", Math.round(Number(d.counted) || 0)))) return;
+      await api("/register/close", "POST", d); toast(t("closed"), "ok"); pageRegister(v, day);
+    };
   }
   $("#openF") && ($("#openF").onsubmit = async (e) => { e.preventDefault(); await api("/register/open", "POST", Object.fromEntries(new FormData(e.target))); pageRegister(v, day); });
-  $("#reopenB") && ($("#reopenB").onclick = async () => { await api("/register/reopen", "POST", {}); pageRegister(v, day); });
+  $("#reopenB") && ($("#reopenB").onclick = async () => { if (confirm(t("reopen_confirm"))) { await api("/register/reopen", "POST", { day }); pageRegister(v, day); } });
   $$("[data-del]", v).forEach((b) => b.onclick = async () => { if (confirm(t("confirm_delete"))) { await api(`/register/move/${b.dataset.del}/delete`, "POST", {}); pageRegister(v, day); } });
+}
+
+/* ---------------- SAFE (manager) ---------------- */
+const SAFE_CATS = { in: ["deposit", "bank_withdrawal", "other_in"], out: ["withdrawal", "bank_deposit", "expense", "salary", "other"] };
+async function pageSafe(v, f) {
+  f = f || { from: new Date().toLocaleDateString("sv-SE").slice(0, 8) + "01", to: "" };
+  const q = new URLSearchParams(Object.entries(f).filter(([, x]) => x)).toString();
+  const sf = await api("/safe" + (q ? "?" + q : ""));
+  let dir = "out";
+  v.innerHTML = `
+  <div class="page-head"><h1>${t("nav_safe")}</h1>
+    <div class="row" style="flex:0 1 420px"><input type="date" class="input" id="sfFrom" value="${f.from}"><input type="date" class="input" id="sfTo" value="${f.to}"></div></div>
+  <div class="kpis">
+    <div class="kpi accent"><div class="l">${t("safe_balance")}</div><div class="v">${money(sf.balance)}</div></div>
+    <div class="kpi"><div class="l">${t("kpi_in")} (${t("period")})</div><div class="v amt-in">${money(sf.total_in)}</div></div>
+    <div class="kpi"><div class="l">${t("kpi_out")} (${t("period")})</div><div class="v amt-out">${money(sf.total_out)}</div></div>
+  </div>
+  <div class="grid g2">
+    <div class="card"><h2>${t("add_move")}</h2>
+      <div class="seg" id="sDir"><button data-d="in">${t("money_in")}</button><button data-d="out" class="on">${t("money_out")}</button></div>
+      <form id="sfF"><div class="row"><div class="field"><label>${t("category")}</label><select class="input" name="category" id="sfCat"></select></div>
+        <div class="field"><label>${t("amount")}</label><input class="input num" name="amount" inputmode="decimal" required></div></div>
+        <div class="field"><label>${t("note")}</label><input class="input" name="note"></div>
+        <button class="btn primary">${t("save")}</button></form>
+      <p class="sub" style="margin-top:12px">${t("safe_help")}</p></div>
+    <div class="card"><h2>${t("moves")}</h2><div class="list">
+      ${sf.moves.length ? sf.moves.map((m) => `<div class="item"><div class="grow"><div class="t">${catLabel(m.category)}${m.ref_day ? ` <span class="pill">${dmy(m.ref_day)}</span>` : ""}</div>
+        <div class="s">${[`${dmy(m.ts)} ${hm(m.ts)}`, esc(m.note), esc(m.by_name || "")].filter(Boolean).join(" · ")}</div></div>
+        <span class="${m.direction === "in" ? "amt-in" : "amt-out"}">${m.direction === "in" ? "+" : "−"}${money(m.amount)}</span>
+        ${m.manual ? `<button class="btn ghost sm" data-sdel="${m.id}">✕</button>` : ""}</div>`).join("") : `<div class="empty">${t("nothing")}</div>`}
+    </div></div>
+  </div>`;
+  const fill = () => { $("#sfCat").innerHTML = SAFE_CATS[dir].map((c) => `<option value="${c}">${catLabel(c)}</option>`).join(""); };
+  fill();
+  $$("#sDir button").forEach((b) => b.onclick = () => { dir = b.dataset.d; $$("#sDir button").forEach((x) => x.classList.toggle("on", x === b)); fill(); });
+  $("#sfF").onsubmit = async (e) => { e.preventDefault(); await api("/safe/move", "POST", { ...Object.fromEntries(new FormData(e.target)), direction: dir }); toast(t("saved"), "ok"); pageSafe(v, f); };
+  $("#sfFrom").onchange = $("#sfTo").onchange = () => pageSafe(v, { from: $("#sfFrom").value, to: $("#sfTo").value });
+  $$("[data-sdel]", v).forEach((b) => b.onclick = async () => { if (confirm(t("confirm_delete"))) { await api(`/safe/move/${b.dataset.sdel}/delete`, "POST", {}); pageSafe(v, f); } });
+}
+
+/* ---------------- USERS (manager) ---------------- */
+async function pageUsers(v) {
+  const users = await api("/users");
+  v.innerHTML = `
+  <div class="page-head"><h1>${t("nav_users")}</h1><button class="btn primary" id="uNew">+ ${t("new_user")}</button></div>
+  <div class="card"><div class="list">
+    ${users.map((u) => `<div class="item"><div class="avatar">${esc(initials(u.name || u.email))}</div>
+      <div class="grow"><div class="t">${esc(u.name || "")} ${u.id === S.user.uid ? `<span class="pill">${t("you")}</span>` : ""}</div><div class="s">${esc(u.email)}</div></div>
+      <span class="pill ${u.role === "manager" ? "accent" : ""}">${t("role_" + u.role)}</span>
+      ${u.active === false ? `<span class="pill red">${t("disabled")}</span>` : ""}
+      ${u.id !== S.user.uid ? `<button class="btn sm" data-u="${u.id}">${t("edit")}</button>` : ""}</div>`).join("")}
+  </div></div>
+  <p class="sub" style="margin-top:12px">${t("users_help")}</p>`;
+  $("#uNew").onclick = () => {
+    modal(`<div class="modal-head"><h1>${t("new_user")}</h1><button class="btn ghost" onclick="closeModal()">✕</button></div>
+      <form id="uf"><div class="field"><label>${t("name")}</label><input class="input" name="name" required></div>
+      <div class="field"><label>${t("email")}</label><input class="input" type="email" name="email" required autocomplete="off"></div>
+      <div class="field"><label>${t("pwd")} (≥ 6)</label><input class="input" type="text" name="password" required minlength="6" autocomplete="new-password"></div>
+      <div class="field"><label>${t("role")}</label><select class="input" name="role"><option value="operator">${t("role_operator")}</option><option value="manager">${t("role_manager")}</option></select></div>
+      <button class="btn primary">${t("save")}</button></form>`);
+    $("#uf").onsubmit = async (e) => { e.preventDefault(); await api("/users", "POST", Object.fromEntries(new FormData(e.target))); toast(t("saved"), "ok"); closeModal(); pageUsers(v); };
+  };
+  $$("[data-u]", v).forEach((b) => b.onclick = () => {
+    const u = users.find((x) => x.id === b.dataset.u);
+    modal(`<div class="modal-head"><h1>${esc(u.name || u.email)}</h1><button class="btn ghost" onclick="closeModal()">✕</button></div>
+      <form id="uf"><div class="field"><label>${t("name")}</label><input class="input" name="name" value="${esc(u.name)}"></div>
+      <div class="field"><label>${t("role")}</label><select class="input" name="role"><option value="operator" ${u.role === "operator" ? "selected" : ""}>${t("role_operator")}</option><option value="manager" ${u.role === "manager" ? "selected" : ""}>${t("role_manager")}</option></select></div>
+      <label class="switch"><input type="checkbox" name="active" ${u.active !== false ? "checked" : ""}> ${t("account_active")}</label>
+      <div class="row"><button class="btn primary">${t("save")}</button><button type="button" class="btn" id="uReset">${t("send_reset")}</button></div></form>`);
+    $("#uf").onsubmit = async (e) => { e.preventDefault(); const d = Object.fromEntries(new FormData(e.target)); d.active = e.target.active.checked;
+      await api(`/users/${u.id}`, "PUT", d); toast(t("saved"), "ok"); closeModal(); pageUsers(v); };
+    $("#uReset").onclick = async () => { await api(`/users/${u.id}/reset`, "POST", { email: u.email }); toast(t("reset_sent"), "ok"); };
+  });
 }
 
 /* ---------------- SUPPLIERS ---------------- */
@@ -766,7 +940,7 @@ async function pageSuppliers(v) {
     $("#sl").innerHTML = list.length ? list.map((s) => `<div class="item click" data-s="${s.id}"><div class="avatar">${esc(initials(s.name))}</div>
       <div class="grow"><div class="t">${esc(s.name)}</div><div class="s">${t("purchased")} : ${money(s.purchased)}</div></div>
       ${s.owed > 0.001 ? `<span class="pill red">${money(s.owed)}</span>` : `<span class="pill green">${t("settled")}</span>`}</div>`).join("") : `<div class="empty">${t("nothing")}</div>`;
-    $$("[data-s]", v).forEach((el) => el.onclick = () => openSupplier(+el.dataset.s, load));
+    $$("[data-s]", v).forEach((el) => el.onclick = () => openSupplier(el.dataset.s, load));
   };
   $("#sNew").onclick = () => editParty("suppliers", null, load);
   load();
@@ -784,7 +958,7 @@ async function openSupplier(id, onChange) {
         <div class="row"><div class="field"><label>${t("total")}</label><input class="input num" name="total" inputmode="decimal" required></div>
         <div class="field"><label>${t("paid")}</label><input class="input num" name="paid" inputmode="decimal" placeholder="= ${t("total")}"></div></div>
         <button class="btn primary">${t("save")}</button></form>
-      <form class="card" id="spF"><h2>${t("pay_supplier")}</h2><div class="field"><label>${t("amount")}</label><input class="input num" name="amount" inputmode="decimal" required value="${s.owed > 0 ? Math.round(s.owed) : ""}"></div>
+      <form class="card" id="spF"><h2>${t("pay_supplier")}</h2><p class="sub">${t("paid_from_safe")}</p><div class="field"><label>${t("amount")}</label><input class="input num" name="amount" inputmode="decimal" required value="${s.owed > 0 ? Math.round(s.owed) : ""}"></div>
         <div class="field"><label>${t("note")}</label><input class="input" name="note"></div><button class="btn green">${t("pay_supplier")}</button></form>
     </div>
     <h2>${t("history")}</h2><table><tbody>${hist.length ? hist.map((h) => h._k === "buy"
@@ -796,61 +970,84 @@ async function openSupplier(id, onChange) {
   $("#spF").onsubmit = async (e) => { e.preventDefault(); await api(`/suppliers/${id}/pay`, "POST", Object.fromEntries(new FormData(e.target))); again(); };
 }
 
-/* ---------------- SETTINGS ---------------- */
+/* ---------------- SETTINGS (manager) ---------------- */
 async function pageSettings(v) {
   const st = S.settings = await api("/settings");
   await refreshStatus(); renderShell();
-  const s = S.status;
-  let statusLine = s.mode === "demo" ? `<span class="dot demo"></span>${t("demo_badge")}`
-    : s.authorized ? `<span class="dot ${s.bot_ok ? "on" : "off"}"></span>${t("connected_as")} ${esc(s.me)} · ${s.bot_ok ? t("bot_ready") : t("bot_missing")}`
-    : `<span class="dot off"></span>${t("not_linked")} ${s.error ? `<span class="sub">(${esc(s.error)})</span>` : ""}`;
   v.innerHTML = `<div class="page-head"><h1>${t("settings")}</h1>
       <div class="seg" style="margin:0;width:220px"><button data-l="fr" class="${S.lang === "fr" ? "on" : ""}">Français</button><button data-l="ar" class="${S.lang === "ar" ? "on" : ""}">العربية</button></div></div>
     <div class="grid g2">
-      <form class="card" id="setF">
-        <h2>${t("tg_link")}</h2>
-        <div class="status-box">${statusLine}</div>
-        <label class="switch"><input type="checkbox" name="demo" ${st.demo ? "checked" : ""}> ${t("demo_mode")}</label>
-        <p class="sub">${t("api_help")}</p>
-        <div class="row"><div class="field"><label>${t("api_id")}</label><input class="input num" name="api_id" value="${esc(st.api_id)}"></div>
-          <div class="field"><label>${t("api_hash")}</label><input class="input num" name="api_hash" placeholder="${st.has_api_hash ? "••••••••" : ""}"></div></div>
-        <div class="field"><label>${t("bot_user")}</label><input class="input num" name="bot" value="${esc(st.bot)}" placeholder="@ProviderBot"></div>
+      <form class="card" id="shopF">
+        <h2>${t("shop")}</h2>
+        <div class="row"><div class="field"><label>${t("shop_name")}</label><input class="input" name="shop_name" value="${esc(st.shop_name)}"></div>
+          <div class="field" style="flex:0 0 100px"><label>${t("currency")}</label><input class="input" name="currency" value="${esc(st.currency)}"></div></div>
+        <label class="switch"><input type="checkbox" name="confirm_before_send" ${st.confirm_before_send !== false ? "checked" : ""}> ${t("confirm_setting")}</label>
+        <label class="switch"><input type="checkbox" name="float_from_safe" ${st.float_from_safe ? "checked" : ""}> ${t("float_setting")}</label>
+        <div class="field"><label>${t("default_float")}</label><input class="input num" name="default_float" inputmode="numeric" value="${esc(st.default_float || 0)}"></div>
         <h2 style="margin-top:20px">${t("bot_formats")}</h2>
         <p class="sub" style="margin-top:-8px">${t("template_hint")}</p>
         ${[["flexy", "op_flexy"], ["international", "op_international"], ["bill_djezzy", "bill_djezzy"], ["bill_ooredoo", "bill_ooredoo"]].map(([k, l]) =>
           `<div class="field"><label>${t(l)}</label><input class="input num" data-cmd="${k}" value="${esc((st.commands || {})[k])}"></div>`).join("")}
         <div class="field"><label>${t("op_offers")}</label><input class="input num" name="template" value="${esc(st.template)}"></div>
-        <div class="field"><label>${t("reply_wait")}</label><input class="input num" name="reply_wait" value="${esc(st.reply_wait)}" inputmode="decimal"></div>
-        <h2 style="margin-top:20px">${t("shop")}</h2>
-        <div class="row"><div class="field"><label>${t("shop_name")}</label><input class="input" name="shop_name" value="${esc(st.shop_name)}"></div>
-          <div class="field" style="flex:0 0 100px"><label>${t("currency")}</label><input class="input" name="currency" value="${esc(st.currency)}"></div></div>
+        <h2 style="margin-top:20px">${t("bot_pc")}</h2>
+        <p class="sub" style="margin-top:-8px">${t("bot_pc_help")}</p>
+        <div class="row"><div class="field"><label>${t("server_address")}</label><input class="input num" name="bridge_url" value="${esc(st.bridge_url)}" placeholder="http://localhost:8765"></div>
+          <div class="field"><label>${t("access_key")}</label><input class="input num" name="bridge_key" value="${esc(st.bridge_key)}" placeholder="XXXX-XXXX-XXXX" style="text-transform:uppercase"></div></div>
         <button class="btn primary">${t("save")}</button>
       </form>
       <div>
-        <div class="card" id="loginCard"></div>
-        <div class="card" style="margin-top:16px"><h2>${t("remote_access")}</h2>
-          ${REMOTE
-            ? `<div class="status-box"><span class="dot on"></span><span class="num">${esc(serverUrl())}</span></div>
-               <button class="btn" id="chSrv">${t("change_server")}</button>`
-            : `<p class="sub">${t("remote_help")}</p>
-               <div class="field"><label>${t("access_key")}</label><div class="status-box num" style="font-size:20px;letter-spacing:.08em">${esc(st.access_key)}</div></div>`}
-        </div>
+        <div class="card" id="bridgeCard"></div>
+        <div class="card" id="loginCard" style="margin-top:16px"></div>
       </div>
     </div>`;
-  $("#chSrv") && ($("#chSrv").onclick = () => showConnect(""));
   $$("[data-l]", v).forEach((b) => b.onclick = () => setLang(b.dataset.l));
-  $("#setF").onsubmit = async (e) => {
+  $("#shopF").onsubmit = async (e) => {
     e.preventDefault();
-    const d = Object.fromEntries(new FormData(e.target)); d.demo = !!e.target.demo.checked;
+    const d = Object.fromEntries(new FormData(e.target));
+    d.confirm_before_send = e.target.confirm_before_send.checked; d.float_from_safe = e.target.float_from_safe.checked;
+    d.bridge_key = (d.bridge_key || "").trim().toUpperCase();
     d.commands = Object.fromEntries($$("[data-cmd]", e.target).map((i) => [i.dataset.cmd, i.value.trim()]));
-    if (!d.api_hash) delete d.api_hash;
     S.settings = await api("/settings", "PUT", d); toast(t("saved"), "ok"); pageSettings(v);
+  };
+  renderBridgeCard();
+}
+
+/* Telegram settings live on the bot PC (the session file never leaves it) */
+async function renderBridgeCard() {
+  const c = $("#bridgeCard"); if (!c) return;
+  let bs;
+  try { bs = await api("/bridge/settings", "GET", null, true); }
+  catch (e) {
+    c.innerHTML = `<h2>${t("tg_link")}</h2><div class="status-box"><span class="dot off"></span>${t(e.message === "bridge_key" ? "err_bridge_key" : "err_bridge_unreachable")}</div><p class="sub">${t("bot_pc_help")}</p>`;
+    $("#loginCard").innerHTML = ""; $("#loginCard").classList.add("hidden");
+    return;
+  }
+  $("#loginCard").classList.remove("hidden");
+  const s = S.status;
+  const line = s.mode === "demo" ? `<span class="dot demo"></span>${t("demo_badge")}`
+    : s.authorized ? `<span class="dot ${s.bot_ok ? "on" : "off"}"></span>${t("connected_as")} ${esc(s.me)} · ${s.bot_ok ? t("bot_ready") : t("bot_missing")}`
+    : `<span class="dot off"></span>${t("not_linked")} ${s.error ? `<span class="sub">(${esc(s.error)})</span>` : ""}`;
+  c.innerHTML = `<form id="tgF"><h2>${t("tg_link")}</h2>
+      <div class="status-box">${line}</div>
+      <label class="switch"><input type="checkbox" name="demo" ${bs.demo ? "checked" : ""}> ${t("demo_mode")}</label>
+      <p class="sub">${t("api_help")}</p>
+      <div class="row"><div class="field"><label>${t("api_id")}</label><input class="input num" name="api_id" value="${esc(bs.api_id)}"></div>
+        <div class="field"><label>${t("api_hash")}</label><input class="input num" name="api_hash" placeholder="${bs.has_api_hash ? "••••••••" : ""}"></div></div>
+      <div class="field"><label>${t("bot_user")}</label><input class="input num" name="bot" value="${esc(bs.bot)}" placeholder="@ProviderBot"></div>
+      <div class="field"><label>${t("reply_wait")}</label><input class="input num" name="reply_wait" value="${esc(bs.reply_wait)}" inputmode="decimal"></div>
+      <button class="btn primary">${t("save")}</button></form>`;
+  $("#tgF").onsubmit = async (e) => {
+    e.preventDefault();
+    const d = Object.fromEntries(new FormData(e.target)); d.demo = e.target.demo.checked;
+    if (!d.api_hash) delete d.api_hash;
+    await api("/bridge/settings", "PUT", d); toast(t("saved"), "ok"); await refreshStatus(); renderShell(); renderBridgeCard();
   };
   renderLogin();
 }
 
 function renderLogin() {
   const c = $("#loginCard"), s = S.status;
+  c.style.opacity = 1;
   if (s.mode === "demo" || !s.configured) { c.innerHTML = `<h2>${t("login")}</h2><p class="sub">${t("api_help")}</p>`; c.style.opacity = .6; return; }
   if (s.authorized) {
     c.innerHTML = `<h2>${t("login")}</h2><div class="status-box"><span class="dot on"></span>${t("connected_as")} ${esc(s.me)}</div><button class="btn red" id="loB">${t("logout")}</button>`;
@@ -874,40 +1071,89 @@ function renderLogin() {
   };
 }
 
-/* ---------------- connect (GitHub Pages → shop PC) ---------------- */
-function showConnect(reason) {
-  S.offline = true;
+/* ---------------- sign-in screens ---------------- */
+function authCard(inner) {
   renderShell();
-  $("#view").innerHTML = `
-  <div class="card connect-card">
-    <div class="logo" style="width:52px;height:52px;margin-bottom:14px">${svg("register")}</div>
-    <h1>${t("connect_title")}</h1>
-    <p class="sub">${t("connect_help")}</p>
-    ${reason ? `<div class="notice" style="margin:12px 0">${t("err_" + reason)}</div>` : ""}
-    <form id="cnF">
-      <div class="field"><label>${t("server_address")}</label><input class="input num" name="server" value="${esc(serverUrl())}" placeholder="http://localhost:8765"></div>
-      <div class="field"><label>${t("access_key")}</label><input class="input num" name="key" value="${esc(accessKey())}" placeholder="XXXX-XXXX-XXXX" autocomplete="off" style="text-transform:uppercase"></div>
-      <button class="btn primary" style="width:100%">${t("connect")}</button>
-    </form>
-    <p class="sub" style="margin-top:14px">${t("connect_note")}</p>
-  </div>`;
-  $("#cnF").onsubmit = async (e) => {
-    e.preventDefault();
-    localStorage.setItem("server", e.target.server.value.trim());
-    localStorage.setItem("key", e.target.key.value.trim().toUpperCase());
-    try { await api("/ping", "GET", null, true); } catch (err) { return showConnect(err.message === "bad_key" ? "bad_key" : "unreachable"); }
-    S.offline = false; toast("✓", "ok"); start();
-  };
+  $("#view").innerHTML = `<div class="auth-wrap"><div class="card auth-card">
+    <div class="auth-brand"><span class="logo">${svg("register")}</span><b>${esc(S.settings.shop_name || "SIM Desk")}</b>
+      <button class="btn sm ghost" id="authLang">${S.lang === "ar" ? "Français" : "العربية"}</button></div>${inner}</div></div>`;
+  $("#authLang").onclick = () => setLang(S.lang === "ar" ? "fr" : "ar");
+}
+
+function renderAuth(a) {
+  S.authState = a;
+  if (!Store.configured()) {
+    return authCard(`<h1>${t("fb_missing_title")}</h1><p class="sub">${t("fb_missing_help")}</p>`);
+  }
+  if (a.state === "signed_out") {
+    authCard(`<h1>${t("sign_in_title")}</h1>
+      <form id="loginF"><div class="field"><label>${t("email")}</label><input class="input" type="email" name="email" required autocomplete="username"></div>
+      <div class="field"><label>${t("pwd")}</label><input class="input" type="password" name="password" required autocomplete="current-password"></div>
+      <button class="btn primary" style="width:100%">${t("sign_in")}</button></form>
+      <button class="btn ghost sm" id="forgotB" style="margin-top:10px">${t("forgot")}</button>
+      <details class="first-run"><summary>${t("first_run")}</summary><p class="sub">${t("first_run_help")}</p>
+        <form id="firstF"><div class="field"><label>${t("email")}</label><input class="input" type="email" name="email" required></div>
+        <div class="field"><label>${t("pwd")} (≥ 6)</label><input class="input" type="password" name="password" minlength="6" required autocomplete="new-password"></div>
+        <button class="btn">${t("create_account")}</button></form></details>`);
+    $("#loginF").onsubmit = async (e) => { e.preventDefault(); const b = e.target.querySelector("button"); b.disabled = true;
+      try { await Store.login(e.target.email.value, e.target.password.value); } catch (err) { toast(t("err_" + err.code) || err.message, "err"); b.disabled = false; } };
+    $("#forgotB").onclick = async () => { const em = $("#loginF").email.value; if (!em) return $("#loginF").email.focus();
+      try { await Store.resetPassword(em); toast(t("reset_sent"), "ok"); } catch (err) { toast(err.code || err.message, "err"); } };
+    $("#firstF").onsubmit = async (e) => { e.preventDefault();
+      try { await Store.createFirstAccount(e.target.email.value, e.target.password.value); } catch (err) { toast(t("err_" + err.code), "err"); } };
+    return;
+  }
+  if (a.state === "setup") {
+    authCard(`<h1>${t("setup_title")}</h1><p class="sub">${t("setup_help").replace("{e}", esc(a.user.email))}</p>
+      <form id="setupF"><div class="field"><label>${t("name")}</label><input class="input" name="name" required></div>
+      <div class="field"><label>${t("shop_name")}</label><input class="input" name="shop" value="SIM Desk"></div>
+      <button class="btn primary" style="width:100%">${t("setup_go")}</button></form>
+      <button class="btn ghost sm" id="outB" style="margin-top:10px">${t("logout_app")}</button>`);
+    $("#setupF").onsubmit = async (e) => { e.preventDefault();
+      try { await Store.bootstrap(e.target.name.value.trim()); await Store.route("/settings", "PUT", { shop_name: e.target.shop.value.trim() || "SIM Desk" }); enterApp(Store.me); }
+      catch (err) { toast(err.code === "permission-denied" ? t("err_setup_done") : (err.code || err.message), "err"); } };
+    $("#outB").onclick = () => Store.logout();
+    return;
+  }
+  if (a.state === "no_access") {
+    authCard(`<h1>${t("no_access_title")}</h1><p class="sub">${t("no_access_help").replace("{e}", esc(a.user?.email || ""))}</p>
+      <button class="btn" id="outB">${t("logout_app")}</button>`);
+    $("#outB").onclick = () => Store.logout();
+  }
+}
+
+const BRIDGE_API_NEEDED = 2;
+async function checkBridgeVersion() {
+  try {
+    const p = await api("/ping", "GET", null, true);
+    S.bridgeOutdated = !(p && p.api >= BRIDGE_API_NEEDED);
+  } catch { S.bridgeOutdated = false; }   // unreachable is reported elsewhere
+  renderBotBadge();
+  if (S.bridgeOutdated) toast(t("err_bridge_outdated"), "err");
+}
+let unwatch = null, statusTimer = null;
+function enterApp(user) {
+  S.user = user;
+  if (unwatch) unwatch();
+  let first = true;
+  unwatch = Store.watchSettings((st) => {
+    S.settings = st; renderShell();
+    if (first) { first = false; refreshStatus().then(renderBotBadge); checkBridgeVersion(); }   // bridge key comes with the settings
+  });
+  clearInterval(statusTimer);
+  statusTimer = setInterval(async () => { if (S.user) { await refreshStatus(); renderBotBadge(); } }, 30000);
+  route();
 }
 
 /* ---------------- boot ---------------- */
-async function start() {
-  try { S.settings = await api("/settings"); } catch { return; }
-  await refreshStatus();
-  route();
-}
-(async function boot() {
-  if (REMOTE && !accessKey()) return showConnect("");
-  await start();
-  setInterval(async () => { if (S.offline) return; try { S.status = await api("/bot/status", "GET", null, true); renderShell(); } catch {} }, 30000);
+(function boot() {
+  if (!Store.configured()) { S.user = null; return renderAuth({ state: "signed_out" }); }
+  Store.init();
+  Store.onUser((a) => {
+    if (a.state === "ready") return enterApp(a.user);
+    S.user = null; S.menu = null;
+    if (unwatch) { unwatch(); unwatch = null; }
+    location.hash = "";
+    renderAuth(a);
+  });
 })();

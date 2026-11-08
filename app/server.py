@@ -1,4 +1,9 @@
-"""Web server: serves the interface and a small JSON API. Run with:  python run.py"""
+"""SIM Desk bot bridge — runs on the shop PC that is logged into Telegram.
+
+All business data (clients, sales, registers, safe…) now lives in Firebase Firestore and is handled by the
+web interface directly. This server only does what a browser cannot: talk to the provider's Telegram bot.
+Every /api call except /api/ping must carry the access key shown in this PC's SIM Desk window.
+"""
 from contextlib import asynccontextmanager
 
 from starlette.applications import Starlette
@@ -9,12 +14,9 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route, Mount
 from starlette.staticfiles import StaticFiles
 
-from . import db
-from .bridge import make_bridge, load_config, save_config, BotError, DEFAULT_CONFIG, build_command
+from .bridge import make_bridge, load_config, save_config, BotError, DEFAULT_CONFIG
 from .paths import WEB
 
-# The interface hosted on GitHub Pages lives on another website (https://<you>.github.io),
-# so the browser asks this PC for permission first (CORS), and every request must carry the access key.
 PAGES_ORIGINS = r"https://[A-Za-z0-9-]+\.github\.io"
 state = {"bridge": None}
 
@@ -32,21 +34,17 @@ async def restart_bridge():
 
 @asynccontextmanager
 async def lifespan(app):
-    db.init()
     await restart_bridge()
     yield
     await bridge().stop()
 
 
 class KeyGuard(BaseHTTPMiddleware):
-    """Requests coming from another site (GitHub Pages) must show the access key printed on this PC."""
-
     async def dispatch(self, request, call_next):
-        origin = request.headers.get("origin")
-        if origin and request.url.path.startswith("/api/") and request.method != "OPTIONS":
-            own = f"{request.url.scheme}://{request.headers.get('host', '')}"
+        path = request.url.path
+        if path.startswith("/api/") and path != "/api/ping" and request.method != "OPTIONS":
             key = request.headers.get("x-simdesk-key", "").strip().upper()
-            if origin != own and key != load_config()["access_key"].upper():
+            if key != load_config()["access_key"].upper():
                 return JSONResponse({"ok": False, "error": "bad_key"}, status_code=401)
         return await call_next(request)
 
@@ -67,54 +65,24 @@ def api(fn):
             body = {}
         try:
             return ok(await fn(request, body))
-        except BotError as e:
+        except (BotError, ValueError) as e:
             return fail(e)
-        except ValueError as e:
-            return fail(e)
-        except Exception as e:  # keep the UI alive and show the reason
+        except Exception as e:
             return fail(f"{type(e).__name__}: {e}", 500)
     return handler
 
 
-def pid(request, key="id"):
-    return int(request.path_params[key])
-
-
 # ---------------- bot
+# Raise when the web interface starts needing a new bridge route; the interface warns if the PC is older.
+BRIDGE_API = 2
+
+
+async def ping(r, b):
+    return {"app": "simdesk-bridge", "api": BRIDGE_API, "mode": "demo" if load_config().get("demo") else "telegram"}
+
+
 async def bot_status(r, b):
-    st = await bridge().status()
-    cfg = load_config()
-    st["template"] = cfg.get("template")
-    return st
-
-
-async def bot_lookup(r, b):
-    number = "".join(ch for ch in str(b.get("number", "")) if ch.isdigit() or ch == "+")
-    if len(number) < 6:
-        raise ValueError("invalid_number")
-    text = load_config().get("template", "{number}").replace("{number}", number)
-    return await bridge().send(text)
-
-
-async def bot_topup(r, b):
-    """Flexy / bill / international / offers: the app writes the command, the bot does the operation."""
-    text, op, num = build_command(b.get("number"), b.get("operation", "flexy"), b.get("amount"))
-    res = await bridge().send(text)
-    res.update({"command": text, "operator": op, "number": num})
-    return res
-
-
-async def bot_preview(r, b):
-    text, op, num = build_command(b.get("number"), b.get("operation", "flexy"), b.get("amount"))
-    return {"command": text, "operator": op, "number": num}
-
-
-async def bot_menu(r, b):
-    return await bridge().menu()
-
-
-async def bot_click(r, b):
-    return await bridge().click(int(b["msg_id"]), int(b["row"]), int(b["col"]))
+    return await bridge().status()
 
 
 async def bot_send(r, b):
@@ -124,23 +92,25 @@ async def bot_send(r, b):
     return await bridge().send(text)
 
 
+async def bot_click(r, b):
+    return await bridge().click(int(b["msg_id"]), int(b["row"]), int(b["col"]))
+
+
 async def bot_latest(r, b):
     return await bridge().latest()
 
 
-# ---------------- settings & telegram login
-SAFE_KEYS = ("bot", "template", "commands", "reply_wait", "first_timeout", "demo", "shop_name", "currency", "api_id")
+async def bot_menu(r, b):
+    return await bridge().menu()
 
 
-async def ping(r, b):
-    cfg = load_config()
-    return {"app": "simdesk", "shop_name": cfg.get("shop_name")}
+# ---------------- this PC's Telegram settings
+SAFE_KEYS = ("bot", "reply_wait", "first_timeout", "demo", "api_id")
 
 
 async def get_settings(r, b):
     cfg = load_config()
     out = {k: cfg.get(k) for k in SAFE_KEYS}
-    out["access_key"] = cfg.get("access_key")
     out["has_api_hash"] = bool(cfg.get("api_hash"))
     return out
 
@@ -174,147 +144,6 @@ async def tg_logout(r, b):
     return {"ok": True}
 
 
-# ---------------- business
-async def dashboard(r, b):
-    return db.dashboard()
-
-
-async def clients(r, b):
-    return db.list_clients(r.query_params.get("q", ""))
-
-
-async def client_get(r, b):
-    c = db.get_client(pid(r))
-    if not c:
-        raise ValueError("not_found")
-    return c
-
-
-async def client_create(r, b):
-    if not b.get("name", "").strip():
-        raise ValueError("name_required")
-    return {"id": db.save_client(b)}
-
-
-async def client_update(r, b):
-    return {"id": db.save_client(b, pid(r))}
-
-
-async def client_by_number(r, b):
-    return db.client_by_number(r.query_params.get("n", ""))
-
-
-async def client_delete(r, b):
-    db.delete_client(pid(r))
-    return True
-
-
-async def client_number_add(r, b):
-    return db.add_client_number(pid(r), b.get("number"), b.get("label", ""))
-
-
-async def client_number_delete(r, b):
-    return db.delete_client_number(pid(r), int(r.path_params["nid"]))
-
-
-async def client_statement(r, b):
-    q = r.query_params
-    return db.statement(pid(r), q.get("from") or None, q.get("to") or None, q.get("number") or None, q.get("operator") or None)
-
-
-async def client_pay(r, b):
-    amount = float(b.get("amount") or 0)
-    if amount <= 0:
-        raise ValueError("invalid_amount")
-    db.client_payment(pid(r), amount, b.get("note", ""))
-    return db.get_client(pid(r))
-
-
-async def sales(r, b):
-    return db.list_sales(r.query_params.get("day"))
-
-
-async def sale_create(r, b):
-    if float(b.get("total") or 0) <= 0:
-        raise ValueError("invalid_amount")
-    return {"id": db.add_sale(b)}
-
-
-async def sale_delete(r, b):
-    db.delete_sale(pid(r))
-    return True
-
-
-async def suppliers(r, b):
-    return db.list_suppliers()
-
-
-async def supplier_get(r, b):
-    return db.get_supplier(pid(r))
-
-
-async def supplier_create(r, b):
-    if not b.get("name", "").strip():
-        raise ValueError("name_required")
-    return {"id": db.save_supplier(b)}
-
-
-async def supplier_update(r, b):
-    return {"id": db.save_supplier(b, pid(r))}
-
-
-async def supplier_purchase(r, b):
-    if float(b.get("total") or 0) <= 0:
-        raise ValueError("invalid_amount")
-    db.add_purchase(pid(r), b)
-    return db.get_supplier(pid(r))
-
-
-async def supplier_pay(r, b):
-    amount = float(b.get("amount") or 0)
-    if amount <= 0:
-        raise ValueError("invalid_amount")
-    db.supplier_payment(pid(r), amount, b.get("note", ""))
-    return db.get_supplier(pid(r))
-
-
-async def register_get(r, b):
-    return db.register(r.query_params.get("day"))
-
-
-async def register_open(r, b):
-    db.open_register(float(b.get("opening") or 0))
-    return db.register()
-
-
-async def register_close(r, b):
-    db.close_register(float(b.get("counted") or 0), b.get("note", ""))
-    return db.register()
-
-
-async def register_reopen(r, b):
-    db.reopen_register()
-    return db.register()
-
-
-async def register_move(r, b):
-    amount = float(b.get("amount") or 0)
-    if amount <= 0 or b.get("direction") not in ("in", "out"):
-        raise ValueError("invalid_amount")
-    db.manual_move(b["direction"], b.get("category") or ("other_in" if b["direction"] == "in" else "expense"),
-                   amount, b.get("note", ""))
-    return db.register()
-
-
-async def register_move_delete(r, b):
-    db.delete_move(pid(r))
-    return db.register()
-
-
-async def register_history(r, b):
-    return db.history(int(r.query_params.get("days", 30)))
-
-
 def R(path, fn, methods=("GET",)):
     return Route(path, api(fn), methods=list(methods))
 
@@ -322,45 +151,15 @@ def R(path, fn, methods=("GET",)):
 routes = [
     R("/api/ping", ping),
     R("/api/bot/status", bot_status),
-    R("/api/bot/lookup", bot_lookup, ["POST"]),
-    R("/api/bot/click", bot_click, ["POST"]),
-    R("/api/bot/topup", bot_topup, ["POST"]),
-    R("/api/bot/preview", bot_preview, ["POST"]),
-    R("/api/bot/menu", bot_menu),
     R("/api/bot/send", bot_send, ["POST"]),
+    R("/api/bot/click", bot_click, ["POST"]),
     R("/api/bot/latest", bot_latest),
+    R("/api/bot/menu", bot_menu),
     R("/api/settings", get_settings),
     R("/api/settings", put_settings, ["PUT"]),
     R("/api/telegram/send_code", tg_send_code, ["POST"]),
     R("/api/telegram/sign_in", tg_sign_in, ["POST"]),
     R("/api/telegram/logout", tg_logout, ["POST"]),
-    R("/api/dashboard", dashboard),
-    R("/api/clients", clients),
-    R("/api/clients", client_create, ["POST"]),
-    R("/api/clients/{id:int}", client_get),
-    R("/api/clients/{id:int}", client_update, ["PUT"]),
-    R("/api/clients/{id:int}/pay", client_pay, ["POST"]),
-    R("/api/clients/by_number", client_by_number),
-    R("/api/clients/{id:int}/delete", client_delete, ["POST"]),
-    R("/api/clients/{id:int}/numbers", client_number_add, ["POST"]),
-    R("/api/clients/{id:int}/numbers/{nid:int}/delete", client_number_delete, ["POST"]),
-    R("/api/clients/{id:int}/statement", client_statement),
-    R("/api/sales", sales),
-    R("/api/sales", sale_create, ["POST"]),
-    R("/api/sales/{id:int}/delete", sale_delete, ["POST"]),
-    R("/api/suppliers", suppliers),
-    R("/api/suppliers", supplier_create, ["POST"]),
-    R("/api/suppliers/{id:int}", supplier_get),
-    R("/api/suppliers/{id:int}", supplier_update, ["PUT"]),
-    R("/api/suppliers/{id:int}/purchase", supplier_purchase, ["POST"]),
-    R("/api/suppliers/{id:int}/pay", supplier_pay, ["POST"]),
-    R("/api/register", register_get),
-    R("/api/register/open", register_open, ["POST"]),
-    R("/api/register/close", register_close, ["POST"]),
-    R("/api/register/reopen", register_reopen, ["POST"]),
-    R("/api/register/move", register_move, ["POST"]),
-    R("/api/register/move/{id:int}/delete", register_move_delete, ["POST"]),
-    R("/api/register/history", register_history),
     Mount("/", StaticFiles(directory=WEB, html=True), name="web"),
 ]
 
