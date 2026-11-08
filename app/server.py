@@ -10,7 +10,7 @@ from starlette.routing import Route, Mount
 from starlette.staticfiles import StaticFiles
 
 from . import db
-from .bridge import make_bridge, load_config, save_config, BotError, DEFAULT_CONFIG
+from .bridge import make_bridge, load_config, save_config, BotError, DEFAULT_CONFIG, build_command
 from .paths import WEB
 
 # The interface hosted on GitHub Pages lives on another website (https://<you>.github.io),
@@ -96,6 +96,23 @@ async def bot_lookup(r, b):
     return await bridge().send(text)
 
 
+async def bot_topup(r, b):
+    """Flexy / bill / international / offers: the app writes the command, the bot does the operation."""
+    text, op, num = build_command(b.get("number"), b.get("operation", "flexy"), b.get("amount"))
+    res = await bridge().send(text)
+    res.update({"command": text, "operator": op, "number": num})
+    return res
+
+
+async def bot_preview(r, b):
+    text, op, num = build_command(b.get("number"), b.get("operation", "flexy"), b.get("amount"))
+    return {"command": text, "operator": op, "number": num}
+
+
+async def bot_menu(r, b):
+    return await bridge().menu()
+
+
 async def bot_click(r, b):
     return await bridge().click(int(b["msg_id"]), int(b["row"]), int(b["col"]))
 
@@ -112,7 +129,7 @@ async def bot_latest(r, b):
 
 
 # ---------------- settings & telegram login
-SAFE_KEYS = ("bot", "template", "reply_wait", "first_timeout", "demo", "shop_name", "currency", "api_id")
+SAFE_KEYS = ("bot", "template", "commands", "reply_wait", "first_timeout", "demo", "shop_name", "currency", "api_id")
 
 
 async def ping(r, b):
@@ -181,6 +198,28 @@ async def client_create(r, b):
 
 async def client_update(r, b):
     return {"id": db.save_client(b, pid(r))}
+
+
+async def client_by_number(r, b):
+    return db.client_by_number(r.query_params.get("n", ""))
+
+
+async def client_delete(r, b):
+    db.delete_client(pid(r))
+    return True
+
+
+async def client_number_add(r, b):
+    return db.add_client_number(pid(r), b.get("number"), b.get("label", ""))
+
+
+async def client_number_delete(r, b):
+    return db.delete_client_number(pid(r), int(r.path_params["nid"]))
+
+
+async def client_statement(r, b):
+    q = r.query_params
+    return db.statement(pid(r), q.get("from") or None, q.get("to") or None, q.get("number") or None, q.get("operator") or None)
 
 
 async def client_pay(r, b):
@@ -285,6 +324,9 @@ routes = [
     R("/api/bot/status", bot_status),
     R("/api/bot/lookup", bot_lookup, ["POST"]),
     R("/api/bot/click", bot_click, ["POST"]),
+    R("/api/bot/topup", bot_topup, ["POST"]),
+    R("/api/bot/preview", bot_preview, ["POST"]),
+    R("/api/bot/menu", bot_menu),
     R("/api/bot/send", bot_send, ["POST"]),
     R("/api/bot/latest", bot_latest),
     R("/api/settings", get_settings),
@@ -298,6 +340,11 @@ routes = [
     R("/api/clients/{id:int}", client_get),
     R("/api/clients/{id:int}", client_update, ["PUT"]),
     R("/api/clients/{id:int}/pay", client_pay, ["POST"]),
+    R("/api/clients/by_number", client_by_number),
+    R("/api/clients/{id:int}/delete", client_delete, ["POST"]),
+    R("/api/clients/{id:int}/numbers", client_number_add, ["POST"]),
+    R("/api/clients/{id:int}/numbers/{nid:int}/delete", client_number_delete, ["POST"]),
+    R("/api/clients/{id:int}/statement", client_statement),
     R("/api/sales", sales),
     R("/api/sales", sale_create, ["POST"]),
     R("/api/sales/{id:int}/delete", sale_delete, ["POST"]),

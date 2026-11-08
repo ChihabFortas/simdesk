@@ -24,16 +24,38 @@ L'application démarre en **mode démo** (bot simulé) pour que vous puissiez es
    → tapez le code reçu dans Telegram (et le mot de passe 2FA si vous en avez un) → **Se connecter**.
 4. Le badge en bas à gauche passe au vert : *Bot prêt*.
 
-**Message envoyé au bot** : par défaut le numéro seul (`{number}`). Si votre bot attend une commande,
-mettez par ex. `/recharge {number}`. Si le bot répond lentement, augmentez *Attente après la dernière réponse*.
+**Formats des commandes** (déjà réglés pour le bot Chahine Flexy, modifiables dans Paramètres) :
+
+| Opération | Opérateurs | Envoyé au bot |
+|---|---|---|
+| Flexy | Mobilis, Djezzy, Ooredoo | `0669970022*100` |
+| International (≥ 200 DA) | Mobilis | `0669970022i200` |
+| Facture | Djezzy | `0772415263**2500` |
+| Facture | Ooredoo (05 → 01) | `0150569874*2500` |
+| Offres / ماكتيفيا | tous | `0669970022` (le numéro seul) |
+
+Le menu du bot (رصيد, ديون, الأرباح, بطاقات, سجل التحويلات…) apparaît en haut de l'écran Recharge :
+votre solde, vos dettes et bénéfices chez le fournisseur sont lus directement sur ces boutons.
+Si le bot répond lentement, augmentez *Attente après la dernière réponse*.
 
 ## Utilisation
-- **Recharge** : tapez le numéro → **OK**. La réponse du bot s'affiche en carte (solde, facture…) et ses
-  boutons deviennent de grandes tuiles. Touchez une tuile, confirmez. Si le bot demande un montant ou un code,
-  utilisez la case *Répondre au bot*. Le montant et la description se remplissent tout seuls à droite :
+- **Recharge** : tapez le numéro (l'opérateur est détecté), choisissez *Flexy / Facture / International / Offres*,
+  le montant (ou 100, 200, 500…), puis **Envoyer**. La commande envoyée s'affiche (`→ 0669970022*100`) et la
+  réponse du bot apparaît en carte. Les cartes de jeux / 4G passent par le bouton **بطاقات** : ses choix deviennent
+  de grandes tuiles. Si le bot demande autre chose, utilisez *Répondre au bot*. Le montant et la description se remplissent tout seuls à droite :
   choisissez le client (ou *client de passage*), ajustez *Payé* si le client paie une partie → **Enregistrer**.
   Le reste devient automatiquement une dette du client.
-- **Clients** : dettes de chaque client, historique, bouton **Encaisser** quand il rembourse.
+- **Reconnaissance du client** : dès que le numéro tapé appartient à un client, sa fiche s'affiche à droite :
+  dette, limite de crédit, crédit restant et un état (*Peut recharger* / *A des dettes* / *Limite dépassée*).
+  Le client est choisi automatiquement dans le formulaire de vente.
+- **Numéro inconnu** : choisissez le client dans le formulaire, la case *Ajouter ce numéro à son compte* est cochée ;
+  indiquez le lien (fils, épouse…). Un client peut avoir autant de numéros que nécessaire.
+- **Enregistrer et opération suivante** : la vente est enregistrée (argent en caisse, reste en dette du client)
+  et l'écran est entièrement vidé pour le client suivant.
+- **Clients** : touchez un client pour ouvrir son **relevé** — toutes ses opérations et paiements avec le solde,
+  filtrables par dates (*Ce mois*, *Mois dernier*…), par numéro ou par opérateur. Boutons **Encaisser**, **Modifier**
+  (numéros, limite de crédit), **Imprimer** et **Supprimer**. Supprimer un client efface son compte et ses dettes ;
+  ses ventes restent dans l'historique de la caisse.
 - **Caisse** : ouvrez la journée avec le fond de caisse. Ventes, remboursements, achats et paiements fournisseurs
   s'y ajoutent tout seuls. Ajoutez les dépenses/retraits à la main. Le soir : comptez l'argent → **Clôturer** (l'écart s'affiche).
 - **Fournisseurs** : achats (payés ou à crédit) et paiements.

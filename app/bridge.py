@@ -20,7 +20,15 @@ DEFAULT_CONFIG = {
     "api_id": "",
     "api_hash": "",
     "bot": "",              # e.g. @ProviderTopupBot
-    "template": "{number}", # what is sent to the bot when you press OK
+    "template": "{number}", # number only: shows the bot's offers (ماكتيفيا)
+    # How each operation is written for the provider bot (Chahine Flexy formats).
+    # {number} = 0669970022   {amount} = 100   {number01} = number with its first 2 digits replaced by 01
+    "commands": {
+        "flexy": "{number}*{amount}",
+        "international": "{number}i{amount}",
+        "bill_djezzy": "{number}**{amount}",
+        "bill_ooredoo": "{number01}*{amount}",
+    },
     "reply_wait": 2.5,      # seconds of silence before we consider the bot finished
     "first_timeout": 30,    # max seconds to wait for the bot's first answer
     "demo": True,
@@ -31,10 +39,12 @@ DEFAULT_CONFIG = {
 
 
 def load_config():
-    cfg = dict(DEFAULT_CONFIG)
+    cfg = json.loads(json.dumps(DEFAULT_CONFIG))
     if CONFIG_PATH.exists():
         try:
-            cfg.update(json.loads(CONFIG_PATH.read_text(encoding="utf-8")))
+            saved = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            cfg["commands"].update(saved.pop("commands", {}) or {})
+            cfg.update(saved)
         except Exception:
             pass
     if not cfg.get("access_key"):
@@ -51,6 +61,51 @@ def save_config(cfg):
 
 class BotError(Exception):
     pass
+
+
+OPERATOR_PREFIX = {"05": "Ooredoo", "06": "Mobilis", "07": "Djezzy", "01": "Ooredoo"}
+# which operations each operator supports, and the minimum amount
+OPERATIONS = {
+    "Mobilis": {"flexy": 50, "international": 200, "offers": 0},
+    "Djezzy": {"flexy": 50, "bill": 100, "offers": 0},
+    "Ooredoo": {"flexy": 50, "bill": 100, "offers": 0},
+}
+
+
+def normalize_number(raw):
+    d = "".join(ch for ch in str(raw) if ch.isdigit())
+    if d.startswith("213") and len(d) == 12:
+        d = "0" + d[3:]
+    if len(d) == 9 and d[0] in "567":
+        d = "0" + d
+    return d
+
+
+def build_command(raw_number, operation, amount=None, cfg=None):
+    """Turn (number, operation, amount) into the exact text the bot expects."""
+    cfg = cfg or load_config()
+    num = normalize_number(raw_number)
+    if len(num) != 10 or num[:2] not in OPERATOR_PREFIX:
+        raise ValueError("invalid_number")
+    op = OPERATOR_PREFIX[num[:2]]
+    if num.startswith("01"):        # someone typed the Ooredoo bill form directly
+        num, operation = "05" + num[2:], "bill"
+    allowed = OPERATIONS[op]
+    if operation not in allowed:
+        raise ValueError("operation_not_available")
+    if operation == "offers":
+        return cfg.get("template", "{number}").replace("{number}", num), op, num
+    try:
+        amount = int(float(amount))
+    except (TypeError, ValueError):
+        raise ValueError("invalid_amount")
+    if amount < allowed[operation]:
+        raise ValueError(f"min_amount:{allowed[operation]}")
+    key = {"flexy": "flexy", "international": "international",
+           "bill": "bill_djezzy" if op == "Djezzy" else "bill_ooredoo"}[operation]
+    tpl = cfg["commands"][key]
+    text = tpl.replace("{number01}", "01" + num[2:]).replace("{number}", num).replace("{amount}", str(amount))
+    return text, op, num
 
 
 # ---------------------------------------------------------------- real Telegram
@@ -217,28 +272,48 @@ class TelegramBridge:
             self.cache[m.id] = m
         return {"messages": [serialize(m) for m in reversed(msgs) if not m.out]}
 
+    async def menu(self, refresh=False):
+        """The bot's bottom keyboard (رصيد / ديون / بطاقات …). Its labels carry live values."""
+        self._ready()
+        async with self.lock:
+            for attempt in range(2):
+                msgs = await self.client.get_messages(self.bot_entity, limit=60)
+                for m in msgs:
+                    if type(m.reply_markup).__name__ == "ReplyKeyboardMarkup" and not m.out:
+                        self.cache[m.id] = m
+                        return {"msg_id": m.id, "buttons": serialize(m)["menu"]}
+                if attempt == 0:  # no keyboard in history: ask the bot for it
+                    self._drain()
+                    await self.client.send_message(self.bot_entity, "/start")
+                    await self._collect()
+        return {"msg_id": None, "buttons": []}
+
 
 def serialize(m):
     buttons = []
     if m.buttons:
         for r, row in enumerate(m.buttons):
             buttons.append([{"text": b.text, "r": r, "c": c, "url": getattr(b, "url", None)} for c, b in enumerate(row)])
-    return {"id": m.id, "text": m.raw_text or "", "buttons": buttons,
+    keyboard = type(m.reply_markup).__name__ == "ReplyKeyboardMarkup"
+    return {"id": m.id, "text": m.raw_text or "", "buttons": [] if keyboard else buttons,
+            "menu": buttons if keyboard else None,
             "date": m.date.isoformat() if m.date else "", "edited": bool(m.edit_date)}
 
 
 # ---------------------------------------------------------------- demo bot
-OPERATORS = {"06": "Mobilis", "07": "Djezzy", "05": "Ooredoo"}
-
-
 class DemoBridge:
-    """A pretend provider bot, so the shop can try the interface before linking Telegram."""
+    """A pretend 'Chahine Flexy' bot using the real command formats, to try the app before linking Telegram."""
+
+    MENU = [["🎁 بطاقات"], ["الارباح : {profit} دج", "رصيد : {balance} دج", "ديون : 0 دج"],
+            ["📅 سجل التحويلات", "👨 حسابك", "💰 تحويل الارباح"], ["📗 دليل الاستخدام", "🤙 اتصل بنا"]]
 
     def __init__(self):
         self.cfg = load_config()
         self.msgs = {}
         self.next_id = 1000
-        self.state = {}
+        self.balance = 48500
+        self.profit = 1230
+        self.history = []
 
     async def start(self):
         self.cfg = load_config()
@@ -248,59 +323,75 @@ class DemoBridge:
 
     async def status(self):
         return {"mode": "demo", "configured": False, "connected": True, "authorized": True,
-                "bot": "DemoBot", "bot_ok": True, "me": "Démo", "error": ""}
+                "bot": "Chahine Flexy (démo)", "bot_ok": True, "me": "Démo", "error": ""}
 
-    def _msg(self, text, buttons=None):
+    def _msg(self, text, buttons=None, menu=False):
         self.next_id += 1
         btns = [[{"text": t, "r": r, "c": c, "url": None} for c, t in enumerate(row)] for r, row in enumerate(buttons or [])]
-        m = {"id": self.next_id, "text": text, "buttons": btns, "date": "", "edited": False}
+        m = {"id": self.next_id, "text": text, "buttons": [] if menu else btns, "menu": btns if menu else None,
+             "date": "", "edited": False}
         self.msgs[m["id"]] = m
         return m
 
+    def _menu_msg(self, text):
+        rows = [[b.format(profit=self.profit, balance=self.balance) for b in row] for row in self.MENU]
+        return self._msg(text, rows, menu=True)
+
     async def send(self, text):
         await asyncio.sleep(0.7)
-        num = re.sub(r"\D", "", text)
-        if len(num) < 9:
-            return {"messages": [self._msg("❌ Numéro invalide. Envoyez un numéro à 10 chiffres.")]}
-        op = OPERATORS.get(num[:2], "4G LTE")
-        self.state = {"number": num, "op": op}
-        bal = random.choice([0, 35, 120, 260, 1450])
-        due = random.choice([0, 0, 1500, 2500])
-        lines = [f"📱 Numéro: {num}", f"Opérateur: {op}", f"Solde actuel: {bal} DA"]
-        if due:
-            lines.append(f"Facture du mois: {due} DA")
-            lines.append("Échéance: 15/11/2026")
-        lines.append("")
-        lines.append("Choisissez l'opération :")
-        rows = [["Flexy 100 DA", "Flexy 200 DA", "Flexy 500 DA"], ["Flexy 1000 DA", "Forfait 1500 DA"]]
-        if due:
-            rows.append([f"Payer facture {due} DA"])
-        rows.append(["Carte 4G 2000 DA", "❌ Annuler"])
-        return {"messages": [self._msg("\n".join(lines), rows)]}
+        text = text.strip()
+        if text == "/start":
+            return {"messages": [self._menu_msg("مرحبا بك في Chahine Flexy")]}
+        if "رصيد" in text:
+            return {"messages": [self._msg(f"رصيدك الحالي: {self.balance} دج")]}
+        if "الارباح" in text:
+            return {"messages": [self._msg(f"أرباحك: {self.profit} دج")]}
+        if "ديون" in text:
+            return {"messages": [self._msg("ديونك: 0 دج")]}
+        if "سجل" in text:
+            return {"messages": [self._msg("\n".join(self.history[-10:]) or "لا توجد تحويلات")]}
+        if "بطاقات" in text:
+            return {"messages": [self._msg("اختر البطاقة:", [["Free Fire 1 USD", "Free Fire 5 USD"], ["PUBG 1 USD", "PUBG 5 USD"],
+                                                             ["Idoom 4G 1000 DA", "Idoom 4G 2000 DA"]])]}
+        m = re.fullmatch(r"(0[1567]\d{8})(?:(\*\*|\*|n|i|f|ى)(\d+))?", text)
+        if not m:
+            return {"messages": [self._msg("❌ صيغة غير صحيحة. راجع دليل الاستخدام")]}
+        num, sep, amount = m.groups()
+        if not sep:
+            return {"messages": [self._msg(f"📱 {num}\nاختر العرض:", [["Mix 500 DA", "Mix 1000 DA"], ["Internet 2000 DA", "❌ إلغاء"]])]}
+        amount = int(amount)
+        kind = {"i": "انترناسيونال", "f": "فاتورة", "**": "فاتورة"}.get(sep, "فاتورة" if num.startswith("01") else "ارسال عادي")
+        if amount > self.balance:
+            return {"messages": [self._msg("❌ رصيدك غير كاف")]}
+        self.balance -= amount
+        self.profit += max(1, amount // 50)
+        self.history.append(f"{num} — {kind} — {amount} دج ✅")
+        return {"messages": [self._menu_msg(
+            f"✅ تمت العملية بنجاح\nالرقم: {num}\nالعملية: {kind}\nالمبلغ: {amount} دج\nرصيدك: {self.balance} دج")]}
 
     async def click(self, msg_id, row, col):
-        await asyncio.sleep(0.6)
         m = self.msgs.get(msg_id)
         if not m:
             raise BotError("message_gone")
-        label = m["buttons"][row][col]["text"]
-        if "Annuler" in label:
-            return {"messages": [self._msg("Opération annulée.")], "notice": ""}
-        if label.startswith("✅"):
-            amount = self.state.get("amount", 0)
-            ref = f"TX{random.randint(10000000, 99999999)}"
-            text = (f"✅ Opération réussie\nNuméro: {self.state.get('number')}\nOpération: {self.state.get('label')}\n"
-                    f"Montant: {amount} DA\nRéférence: {ref}\nSolde revendeur: {random.randint(20000, 90000)} DA")
-            if "Carte" in self.state.get("label", ""):
-                text += f"\nCode carte: {random.randint(1000, 9999)}-{random.randint(1000, 9999)}-{random.randint(1000, 9999)}"
-            return {"messages": [self._msg(text)], "notice": "Opération effectuée"}
-        amt = re.search(r"(\d+)\s*DA", label)
-        self.state.update({"label": label, "amount": int(amt.group(1)) if amt else 0})
-        return {"messages": [self._msg(
-            f"Confirmer : {label}\nvers le {self.state.get('number')} ?", [["✅ Confirmer", "❌ Annuler"]])], "notice": ""}
+        btn = (m["buttons"] or m["menu"])[row][col]["text"]
+        if m["menu"]:
+            return await self.send(btn)
+        await asyncio.sleep(0.6)
+        if "إلغاء" in btn:
+            return {"messages": [self._msg("تم الإلغاء")], "notice": ""}
+        amt = re.search(r"(\d+)\s*(DA|USD)", btn)
+        if amt and amt.group(2) == "DA" and int(amt.group(1)) <= self.balance:
+            self.balance -= int(amt.group(1))
+        code = f"{random.randint(1000, 9999)}-{random.randint(1000, 9999)}-{random.randint(1000, 9999)}"
+        extra = f"\nالكود: {code}" if ("USD" in btn or "Idoom" in btn) else ""
+        return {"messages": [self._msg(f"✅ تمت العملية بنجاح\n{btn}{extra}\nرصيدك: {self.balance} دج")], "notice": ""}
 
     async def latest(self, n=3):
         return {"messages": list(self.msgs.values())[-1:]}
+
+    async def menu(self, refresh=False):
+        m = self._menu_msg("القائمة")
+        return {"msg_id": m["id"], "buttons": m["menu"]}
 
     async def send_code(self, phone):
         raise BotError("demo_mode")
