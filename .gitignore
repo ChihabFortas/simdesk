@@ -1,0 +1,12 @@
+# Your shop data and Telegram login — never commit these
+data/
+*.session
+*.session-journal
+
+.venv/
+__pycache__/
+build/
+dist/
+release/
+*.spec
+server.log

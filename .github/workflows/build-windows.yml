@@ -1,0 +1,74 @@
+# Builds SIM-Desk.exe (no Python needed on the shop PC) on every push to main.
+# - Every build: download it from the run's "Artifacts" section (Actions tab).
+# - Push a tag like v1.0.0 to also publish it as a Release with a permanent download link.
+name: Build Windows app
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths-ignore: ["**.md"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Quick check (server starts and answers)
+        shell: bash
+        env:
+          SIMDESK_NO_BROWSER: "1"
+          SIMDESK_PORT: "8799"
+        run: |
+          python run.py > server.log 2>&1 &
+          for i in $(seq 1 20); do
+            sleep 1
+            curl -sf http://127.0.0.1:8799/api/ping && break
+          done
+          curl -sf http://127.0.0.1:8799/api/ping
+          curl -sf http://127.0.0.1:8799/ | grep -q "SIM Desk" || (cat server.log; exit 1)
+          taskkill //F //IM python.exe || true
+
+      - name: Build SIM-Desk.exe
+        run: >
+          pyinstaller --noconfirm --onefile --console
+          --name SIM-Desk
+          --add-data "web;web"
+          --collect-submodules uvicorn
+          --collect-submodules telethon
+          run.py
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force release | Out-Null
+          Copy-Item dist/SIM-Desk.exe release/
+          Copy-Item LISEZ-MOI.md release/
+          Compress-Archive -Path release/* -DestinationPath SIM-Desk-windows.zip -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SIM-Desk-windows
+          path: release/
+
+      - name: Publish release (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: SIM-Desk-windows.zip
+          generate_release_notes: true
