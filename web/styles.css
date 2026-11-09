@@ -316,3 +316,21 @@ a.btn { text-decoration: none; color: inherit; }
   body.signed-in main { padding-top: 58px; }
   .toasts { bottom: 84px; inset-inline: 12px; }
 }
+
+/* sale type */
+.kind-seg { display: flex; flex-wrap: wrap; gap: 6px; }
+.kind-seg button { border: 1.5px solid var(--line); background: #fff; border-radius: 999px; padding: 7px 13px; font-weight: 650; font-size: 13.5px; cursor: pointer; }
+.kind-seg button:hover { border-color: var(--accent); }
+.kind-seg button.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+/* bot answer states */
+.botcard.pending { border-color: #f5d79a; } .botcard.pending .bc-head { background: var(--amber-soft); color: var(--amber); }
+.modal-card.alert { width: min(480px, 100%); }
+.bot-alert { text-align: center; padding: 6px 4px 2px; }
+.ba-icon { font-size: 46px; width: 84px; height: 84px; border-radius: 26px; display: grid; place-items: center; margin: 0 auto 12px; background: var(--red-soft); }
+.bot-alert.amber .ba-icon { background: var(--amber-soft); }
+.bot-alert h1 { font-size: 24px; margin: 4px 0 8px; }
+.bot-alert.red h1 { color: var(--red); } .bot-alert.amber h1 { color: var(--amber); }
+.bot-alert p { color: var(--muted); line-height: 1.5; margin: 0 auto 12px; max-width: 380px; }
+.bot-alert blockquote { margin: 0 0 14px; padding: 10px 14px; background: #f7f8fb; border-radius: 12px; white-space: pre-wrap; font-size: 14px; text-align: start; unicode-bidi: plaintext; }
+.ba-actions { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; }
+.ba-actions .btn { min-width: 110px; padding: 12px 20px; }

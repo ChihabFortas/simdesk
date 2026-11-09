@@ -74,7 +74,7 @@ def api(fn):
 
 # ---------------- bot
 # Raise when the web interface starts needing a new bridge route; the interface warns if the PC is older.
-BRIDGE_API = 2
+BRIDGE_API = 3
 
 
 async def ping(r, b):
@@ -94,6 +94,11 @@ async def bot_send(r, b):
 
 async def bot_click(r, b):
     return await bridge().click(int(b["msg_id"]), int(b["row"]), int(b["col"]))
+
+
+async def bot_cancel(r, b):
+    bridge().cancel()
+    return True
 
 
 async def bot_latest(r, b):
@@ -154,6 +159,7 @@ routes = [
     R("/api/bot/send", bot_send, ["POST"]),
     R("/api/bot/click", bot_click, ["POST"]),
     R("/api/bot/latest", bot_latest),
+    R("/api/bot/cancel", bot_cancel, ["POST"]),
     R("/api/bot/menu", bot_menu),
     R("/api/settings", get_settings),
     R("/api/settings", put_settings, ["PUT"]),

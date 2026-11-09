@@ -30,7 +30,7 @@ DEFAULT_CONFIG = {
         "bill_ooredoo": "{number01}*{amount}",
     },
     "reply_wait": 2.5,      # seconds of silence before we consider the bot finished
-    "first_timeout": 30,    # max seconds to wait for the bot's first answer
+    "first_timeout": 25,    # max seconds to wait for the bot's first answer
     "demo": True,
     "shop_name": "SIM Desk",
     "currency": "DA",
@@ -117,6 +117,7 @@ class TelegramBridge:
         self.queue = asyncio.Queue()
         self.cache = {}             # message id -> telethon Message
         self.lock = asyncio.Lock()
+        self.cancel_event = asyncio.Event()
         self.phone_code_hash = None
         self.last_error = ""
 
@@ -215,23 +216,67 @@ class TelegramBridge:
         while not self.queue.empty():
             self.queue.get_nowait()
 
-    async def _collect(self):
-        """Wait for the bot's answer; keep listening until it goes quiet (bots often edit/send several messages)."""
-        got = {}
-        try:
-            m = await asyncio.wait_for(self.queue.get(), timeout=float(self.cfg.get("first_timeout", 30)))
-            got[m.id] = m
-        except asyncio.TimeoutError:
-            return []
+    def cancel(self):
+        """Stop waiting for the bot (the operator pressed "Arrêter")."""
+        self.cancel_event.set()
+
+    async def _collect(self, after_id, watch=None):
+        """Read the bot's answer to what we just sent.
+
+        Two sources at once: Telegram's push updates (fast) and polling the chat every ~1.2 s (reliable —
+        catches replies whose update was missed and messages the bot *edits* instead of sending new ones).
+        Finishes when the bot has been quiet for `reply_wait` s; keeps waiting while the last message says
+        "processing…"; gives up after `first_timeout` s if nothing came at all.
+        """
         quiet = float(self.cfg.get("reply_wait", 2.5))
-        deadline = time.monotonic() + 20
-        while time.monotonic() < deadline:
-            try:
-                m = await asyncio.wait_for(self.queue.get(), timeout=quiet)
-                got[m.id] = m
-            except asyncio.TimeoutError:
+        first_timeout = float(self.cfg.get("first_timeout", 25))
+        hard_stop = first_timeout + 35
+        sigs = dict(watch or {})          # message id -> (text, edit_date, buttons) before we acted
+        got = {}
+        start = time.monotonic()
+        last_change = None
+        self.cancel_event.clear()
+
+        def consider(m):
+            nonlocal last_change
+            if m is None or getattr(m, "out", False):
+                return
+            sig = signature(m)
+            if m.id > after_id or (m.id in sigs and sigs[m.id] != sig):
+                if m.id not in got or signature(got[m.id]) != sig:
+                    got[m.id] = m
+                    self.cache[m.id] = m
+                    last_change = time.monotonic()
+
+        next_poll = start + 1.2
+        while True:
+            now = time.monotonic()
+            if self.cancel_event.is_set():
                 break
-        return [serialize(m) for m in sorted(got.values(), key=lambda x: x.id)]
+            if got and now - last_change >= quiet and not still_processing(got):
+                break
+            if not got and now - start >= first_timeout:
+                break
+            if now - start >= hard_stop:
+                break
+            try:
+                m = await asyncio.wait_for(self.queue.get(), timeout=max(0.1, min(0.5, next_poll - now)))
+                consider(m)
+            except asyncio.TimeoutError:
+                pass
+            if time.monotonic() >= next_poll:
+                next_poll = time.monotonic() + 1.2
+                try:
+                    for m in await self.client.get_messages(self.bot_entity, limit=10, min_id=after_id):
+                        consider(m)
+                    if sigs:
+                        for m in await self.client.get_messages(self.bot_entity, ids=list(sigs)):
+                            consider(m)
+                except Exception:
+                    pass   # a failed poll is not fatal: push updates still work
+        msgs = [serialize(m) for m in sorted(got.values(), key=lambda x: x.id)]
+        return {"messages": msgs, "waited": round(time.monotonic() - start, 1),
+                "cancelled": self.cancel_event.is_set(), "timed_out": not msgs and not self.cancel_event.is_set()}
 
     def _ready(self):
         if not self.client or self.bot_entity is None:
@@ -241,18 +286,18 @@ class TelegramBridge:
         self._ready()
         async with self.lock:
             self._drain()
-            await self.client.send_message(self.bot_entity, text)
-            return {"messages": await self._collect()}
+            sent = await self.client.send_message(self.bot_entity, text)
+            return await self._collect(after_id=sent.id)
 
     async def click(self, msg_id, row, col):
         self._ready()
         async with self.lock:
-            msg = self.cache.get(msg_id)
-            if msg is None:
-                msg = await self.client.get_messages(self.bot_entity, ids=msg_id)
+            msg = await self.client.get_messages(self.bot_entity, ids=msg_id) or self.cache.get(msg_id)
             if msg is None:
                 raise BotError("message_gone")
             self._drain()
+            last = await self.client.get_messages(self.bot_entity, limit=1)
+            after_id = max([msg_id] + [m.id for m in last])
             notice = ""
             try:
                 ans = await msg.click(row, col)
@@ -261,8 +306,9 @@ class TelegramBridge:
             except Exception as e:
                 if "timeout" not in str(e).lower():
                     raise
-            msgs = await self._collect()
-            return {"messages": msgs, "notice": notice}
+            res = await self._collect(after_id=after_id, watch={msg_id: signature(msg)})
+            res["notice"] = notice
+            return res
 
     async def latest(self, n=3):
         """Re-read the last messages of the chat (for bots that answer slowly)."""
@@ -284,9 +330,22 @@ class TelegramBridge:
                         return {"msg_id": m.id, "buttons": serialize(m)["menu"]}
                 if attempt == 0:  # no keyboard in history: ask the bot for it
                     self._drain()
-                    await self.client.send_message(self.bot_entity, "/start")
-                    await self._collect()
+                    sent = await self.client.send_message(self.bot_entity, "/start")
+                    await self._collect(after_id=sent.id)
         return {"msg_id": None, "buttons": []}
+
+
+PROCESSING = re.compile(r"⏳|⌛|جاري|قيد المعالجة|قيد التنفيذ|انتظر|يرجى الانتظار|en cours|patiente|traitement|processing|please wait|pending", re.I)
+
+
+def still_processing(got):
+    """True when the bot's latest message only says it is working on it (an edit or a new message will follow)."""
+    last = max(got.values(), key=lambda m: m.id)
+    return bool(PROCESSING.search(last.raw_text or "")) and not last.buttons
+
+
+def signature(m):
+    return (m.raw_text or "", m.edit_date, bool(m.buttons))
 
 
 def serialize(m):
@@ -309,6 +368,7 @@ class DemoBridge:
 
     def __init__(self):
         self.cfg = load_config()
+        self.cancel_event = asyncio.Event()
         self.msgs = {}
         self.next_id = 1000
         self.balance = 48500
@@ -357,6 +417,20 @@ class DemoBridge:
         if not m:
             return {"messages": [self._msg("❌ صيغة غير صحيحة. راجع دليل الاستخدام")]}
         num, sep, amount = m.groups()
+        # demo scenarios, chosen by the last two digits of the number
+        if num.endswith("00"):        # the bot never answers
+            self.cancel_event.clear()
+            for _ in range(int(float(self.cfg.get("demo_silence", 6)) / 0.2)):
+                if self.cancel_event.is_set():
+                    return {"messages": [], "cancelled": True, "timed_out": False}
+                await asyncio.sleep(0.2)
+            return {"messages": [], "timed_out": True}
+        if num.endswith("11") and not sep:
+            return {"messages": [self._msg(f"📱 {num}\nلا توجد عروض متاحة لهذا الرقم")]}
+        if num.endswith("22"):
+            return {"messages": [self._msg("⚠️ فشلت العملية، حاول مرة أخرى لاحقا")]}
+        if num.endswith("33"):
+            return {"messages": [self._msg("الرقم غير صحيح أو غير موجود")]}
         if not sep:
             return {"messages": [self._msg(f"📱 {num}\nاختر العرض:", [["Mix 500 DA", "Mix 1000 DA"], ["Internet 2000 DA", "❌ إلغاء"]])]}
         amount = int(amount)
@@ -388,6 +462,9 @@ class DemoBridge:
 
     async def latest(self, n=3):
         return {"messages": list(self.msgs.values())[-1:]}
+
+    def cancel(self):
+        self.cancel_event.set()
 
     async def menu(self, refresh=False):
         m = self._menu_msg("القائمة")

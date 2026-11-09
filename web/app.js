@@ -28,10 +28,15 @@ const BRIDGE_PATH = /^\/(bot|telegram|bridge|ping)(\/|$)/;
 
 async function bridgeCall(path, method, body) {
   let res;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), /^\/bot\/(send|click|latest|menu)/.test(path) ? 90000 : 15000);
   try {
     res = await fetch(bridgeBase() + "/api" + path, { method, headers: { "Content-Type": "application/json", "X-SimDesk-Key": S.settings.bridge_key || "" },
-                                                      body: body ? JSON.stringify(body) : undefined });
-  } catch { S.bridgeOk = false; renderBotBadge(); throw new Error("bridge_unreachable"); }
+                                                      body: body ? JSON.stringify(body) : undefined, signal: ctrl.signal });
+  } catch (e) {
+    if (e.name === "AbortError") throw new Error("bridge_timeout");
+    S.bridgeOk = false; renderBotBadge(); throw new Error("bridge_unreachable");
+  } finally { clearTimeout(timer); }
   if (res.status === 401) { S.bridgeOk = false; renderBotBadge(); throw new Error("bridge_key"); }
   // a bot PC running an older SIM-Desk.exe answers "Not Found" (plain text) for routes it doesn't know
   if (res.status === 404) throw new Error("bridge_outdated");
@@ -213,6 +218,12 @@ async function pageRecharge(v) {
   if (!S.menu) loadMenu();
 }
 
+/* A sale's description is its transaction type — nothing else */
+const SALE_KINDS = ["flexy", "offer", "bill", "international", "card"];
+const KIND_STORED = { flexy: "Flexy", offer: "Offre", bill: "Facture", international: "International", card: "Carte" };
+const KIND_OF_OP = { flexy: "flexy", bill: "bill", international: "international", offers: "offer" };
+const kindLabel = (s) => (s.kind ? t("kind_" + s.kind) : s.description || t("sale"));
+
 async function sendOperation() {
   const r = S.rc;
   const num = normNum(r.number), op = opOf(num);
@@ -221,8 +232,9 @@ async function sendOperation() {
   const amount = r.operation === "offers" ? null : Number(r.amount);
   const cmd = buildCommand(num, r.operation, amount);
   r.feed = []; r.batch = [];
-  r.pending = r.operation === "offers" ? null : {
-    description: `${t("op_" + r.operation)} ${op} ${amount} ${S.settings.currency || "DA"}`, total: amount,
+  r.flow = r.operation;
+  r.pending = {   // filled into the sale form only if the bot confirms
+    kind: KIND_OF_OP[r.operation], total: r.operation === "offers" ? "" : amount,
     sim: num.startsWith("01") ? "05" + num.slice(2) : num,
   };
   r.sale = { ...freshSale(), client: r.sale.client, attach: r.sale.attach, label: r.sale.label, sim: r.pending?.sim || num };
@@ -232,7 +244,7 @@ async function sendOperation() {
     const ok = await confirmForCustomer({ num: r.pending?.sim || num, op, operation: r.operation, amount });
     if (!ok) { r.pending = null; return; }
   }
-  await talk(() => api("/bot/send", "POST", { text: cmd }), cmd);
+  await talk(() => api("/bot/send", "POST", { text: cmd }), cmd, () => sendOperation());
 }
 
 /* Big, readable confirmation the customer checks before the operator sends anything */
@@ -272,7 +284,7 @@ function renderProvider() {
   if (!isMgr()) {   // operators only get the cards menu; the shop's account stays private
     btns = btns.filter((b) => /بطاقات|cartes|cards/i.test(b.text));
     el.innerHTML = `<div class="prov-menu">${btns.map((b) => `<button class="pill-btn" data-r="${b.r}" data-c="${b.c}">${esc(b.text)}</button>`).join("")}</div>`;
-    $$(".pill-btn", el).forEach((b) => b.onclick = () => { S.rc.feed = []; S.rc.pending = null;
+    $$(".pill-btn", el).forEach((b) => b.onclick = () => { S.rc.feed = []; S.rc.pending = null; S.rc.flow = "card";
       talk(() => api("/bot/click", "POST", { msg_id: S.menu.msg_id, row: +b.dataset.r, col: +b.dataset.c }), b.textContent); });
     return;
   }
@@ -286,20 +298,24 @@ function renderProvider() {
     <div class="prov-menu">${others.map((b) => `<button class="pill-btn" data-r="${b.r}" data-c="${b.c}">${esc(b.text)}</button>`).join("")}</div>`;
   $("#menuLoad").onclick = loadMenu;
   $$(".pill-btn", el).forEach((b) => b.onclick = () => {
-    S.rc.feed = []; S.rc.pending = null;
+    S.rc.feed = []; S.rc.pending = null; S.rc.flow = /بطاقات|cartes|cards/i.test(b.textContent) ? "card" : "menu";
     talk(() => api("/bot/click", "POST", { msg_id: S.menu.msg_id, row: +b.dataset.r, col: +b.dataset.c }), b.textContent);
   });
 }
 
-async function talk(call, stepLabel) {
+/* Sends something to the bot and reads the answer. `retry` re-runs the same action from the pop-up. */
+async function talk(call, stepLabel, retry) {
   const r = S.rc;
   if (r.busy) return;
-  r.busy = true;
+  r.busy = true; r.waitStart = Date.now();
   if (stepLabel) r.feed.push({ step: stepLabel });
   r.feed.push({ loading: true });
   renderFeed(); setBusy(true);
+  clearInterval(r.waitTimer);
+  r.waitTimer = setInterval(() => { const el = $("#waitSec"); if (el) el.textContent = Math.round((Date.now() - r.waitStart) / 1000) + " s"; }, 500);
+  let res = null;
   try {
-    const res = await call();
+    res = await call();
     r.feed = r.feed.filter((x) => !x.loading);
     if (res.notice) r.feed.push({ notice: res.notice });
     const msgs = res.messages || [];
@@ -309,39 +325,95 @@ async function talk(call, stepLabel) {
       const i = r.feed.findIndex((x) => x.msg && x.msg.id === m.id);
       if (i >= 0) r.feed[i] = { msg: m }; else r.feed.push({ msg: m });
       r.lastText = m.text;
-      afterBotMessage(m);
+      if (m.menu && m.menu.length) { S.menu = { msg_id: m.id, buttons: m.menu }; renderProvider(); }
     }
   } catch (e) {
     r.feed = r.feed.filter((x) => !x.loading);
   }
+  clearInterval(r.waitTimer);
   r.busy = false; setBusy(false); renderFeed();
+  if (res) handleOutcome(interpret(res), res, retry);
 }
 function setBusy(b) { const ok = $("#okBtn"); if (ok) ok.disabled = b; }
 
-function afterBotMessage(m) {
-  if (m.menu && m.menu.length) { S.menu = { msg_id: m.id, buttons: m.menu }; renderProvider(); }
-  const kind = classify(m.text);
-  const r = S.rc;
-  if (kind === "error") { r.pending = null; return; }
-  if (r.pending) {   // the operation we sent: fill the sale form with it
-    Object.assign(r.sale, { description: r.pending.description, total: r.pending.total, paid: r.pending.total, sim: r.pending.sim });
-    r.pending = null;
-    renderSalePanel(kind === "success");
-  } else if (kind === "success") {
-    const amt = parseAmount((m.text.match(/(montant|amount|المبلغ|prix|total)[^\n]*/i) || [""])[0]);
-    if (amt && !r.sale.total) { r.sale.total = amt; r.sale.paid = amt; }
-    renderSalePanel(true);
-  }
+/* ---- understanding the bot's answer ---- */
+const PROCESSING_RE = /⏳|⌛|جاري|قيد المعالجة|قيد التنفيذ|انتظر|يرجى الانتظار|en cours|patiente|traitement|processing|please wait|pending/i;
+const BOT_RULES = [   // first match wins: specific problems before generic ones
+  ["insufficient", /رصيد(ك|كم)?\s*(الحالي\s*)?(غير|لا)\s*(كاف|كافي|يكفي)|غير\s*كاف|insuffisant|insufficient|not enough (balance|credit)|pas assez/i],
+  ["no_offer", /لا\s*(توجد|يوجد|تتوفر|يتوفر)\s*(أي|اي)?\s*(عروض|عرض)|لايوجد\s*عرض|لا عروض|ليس لديه عروض|aucune offre|pas d'offre|no offers?\b/i],
+  ["invalid_number", /(الرقم|رقم)\s*(غير\s*(صحيح|صالح|موجود|مفعل)|خاطئ|خطأ)|numéro (invalide|incorrect|inexistant)|invalid (number|phone)|wrong number/i],
+  ["bad_format", /صيغة\s*(غير|خاطئة)|commande inconnue|unknown command|format (invalide|incorrect)/i],
+  ["cancelled", /تم\s*الإلغاء|ألغيت|إلغاء العملية|annulée?|cancell?ed/i],
+  ["failed", /❌|⛔|فشل|لم\s*(تتم|يتم|تنجح)|تعذر|مرفوض|رفض|خطأ|échec|erreur|refus|failed|error|declined|non effectu/i],
+  ["processing", PROCESSING_RE],
+  ["success", /✅|تمت|تم\s|بنجاح|نجحت|réussi|succès|effectué|success|\bdone\b/i],
+];
+const ERROR_KINDS = new Set(["insufficient", "no_offer", "invalid_number", "bad_format", "failed"]);
+function classify(text) {
+  for (const [kind, rx] of BOT_RULES) if (rx.test(text || "")) return kind;
+  return "";
+}
+/** One verdict for the whole answer (the bot may send several messages). */
+function interpret(res) {
+  const msgs = (res.messages || []).filter((m) => (m.text || "").trim() || (m.buttons || []).length);
+  if (res.cancelled) return { kind: "stopped" };
+  if (!msgs.length) return { kind: "no_reply", waited: res.waited };
+  const kinds = msgs.map((m) => classify(m.text));
+  const err = kinds.find((k) => ERROR_KINDS.has(k));
+  if (err) return { kind: err, text: msgs[kinds.indexOf(err)].text };
+  const last = msgs[msgs.length - 1];
+  if (kinds[kinds.length - 1] === "processing" && !(last.buttons || []).length) return { kind: "processing", text: last.text };
+  if (kinds.includes("cancelled")) return { kind: "cancelled" };
+  if (kinds.includes("success")) return { kind: "success", text: msgs[kinds.lastIndexOf("success")].text };
+  if (msgs.some((m) => (m.buttons || []).length)) return { kind: "choices" };
+  return { kind: "info" };
 }
 
-function classify(text) {
-  if (/❌|⛔|échec|erreur|invalide|error|failed|insuffisant|فشل|خطأ|غير كاف|غير صحيح|مرفوض|رفض/i.test(text)) return "error";
-  if (/✅|réussi|succès|effectué|success|done|تمت|بنجاح|نجحت/i.test(text)) return "success";
-  return "";
+function handleOutcome(o, res, retry) {
+  const r = S.rc;
+  if (o.kind === "success") {
+    if (r.pending) {
+      Object.assign(r.sale, { kind: r.pending.kind, sim: r.pending.sim });
+      if (r.pending.total) { r.sale.total = r.pending.total; r.sale.paid = r.pending.total; }
+      r.pending = null;
+    }
+    renderSalePanel(true);
+    toast(t("bot_ok"), "ok");
+    return;
+  }
+  if (o.kind === "choices" || o.kind === "info") return;          // the operator picks / reads
+  if (o.kind === "stopped") { toast(t("wait_stopped")); return; }
+  if (o.kind === "cancelled") { r.pending = null; toast(t("bot_cancelled")); return; }
+  r.pending = null;   // nothing to record for a failed or unanswered operation
+  // no answer to an offer lookup usually means the SIM has no offer
+  const kind = o.kind === "no_reply" && r.flow === "offers" ? "no_reply_offers" : o.kind;
+  botAlert(kind, o, retry);
+}
+
+const ALERT_ICON = { insufficient: "💰", no_offer: "📭", no_reply_offers: "📭", invalid_number: "📵", bad_format: "⌨️", failed: "⛔", processing: "⏳", no_reply: "🔇" };
+function botAlert(kind, o, retry) {
+  const cls = kind === "processing" ? "amber" : "red";
+  modal(`<div class="bot-alert ${cls}">
+      <div class="ba-icon">${ALERT_ICON[kind] || "⚠️"}</div>
+      <h1>${t("alert_" + kind)}</h1>
+      <p>${t("alert_" + kind + "_help").replace("{s}", Math.round(o.waited || 0))}</p>
+      ${o.text ? `<blockquote dir="auto">${esc(redact(o.text))}</blockquote>` : ""}
+      <div class="ba-actions">
+        ${kind === "processing" || kind.startsWith("no_reply") ? `<button class="btn" id="baCheck">↻ ${t("check_again")}</button>` : ""}
+        ${retry && kind !== "processing" && kind !== "insufficient" ? `<button class="btn" id="baRetry">${t("retry")}</button>` : ""}
+        <button class="btn primary" id="baOk">OK</button>
+      </div></div>`, "alert");
+  const close = () => { document.removeEventListener("keydown", key, true); closeModal(); };
+  const key = (e) => { if (e.key === "Enter" || e.key === "Escape") { e.preventDefault(); close(); } };
+  document.addEventListener("keydown", key, true);
+  $("#baOk").onclick = close; $("#baOk").focus();
+  $("#baCheck") && ($("#baCheck").onclick = () => { close(); talk(() => api("/bot/latest"), null); });
+  $("#baRetry") && ($("#baRetry").onclick = () => { close(); retry(); });
 }
 
 function renderBotCard(m, active) {
-  const kind = classify(m.text);
+  const k = classify(m.text);
+  const kind = k === "success" ? "success" : ERROR_KINDS.has(k) ? "error" : k === "processing" ? "pending" : "";
   const lines = redact(m.text).split("\n").map((l) => l.trim());
   let head = "";
   const firstIdx = lines.findIndex((l) => l);
@@ -374,7 +446,8 @@ function renderFeed() {
   const r = S.rc;
   if (!r.feed.length) { f.innerHTML = `<div class="hint">${t("lookup_hint")}</div>`; return; }
   let html = r.feed.map((x) => {
-    if (x.loading) return `<div class="card loader"><div class="spin"></div>${t("waiting_bot")}</div>`;
+    if (x.loading) return `<div class="card loader"><div class="spin"></div><span>${t("waiting_bot")} <b class="num" id="waitSec"></b></span>
+      <button class="btn sm" id="stopWait" style="margin-inline-start:auto">${t("stop_wait")}</button></div>`;
     if (x.step) return `<div><span class="pill accent">→ ${esc(x.step)}</span></div>`;
     if (x.notice) return `<div class="notice">${esc(x.notice)}</div>`;
     if (x.empty) return `<div class="card loader">${t("no_reply")} <button class="btn sm" id="refreshBtn">${t("refresh")}</button></div>`;
@@ -388,14 +461,15 @@ function renderFeed() {
       <button type="button" class="btn ghost" id="newOpBtn">${t("new_op")}</button>
     </form>`;
   f.innerHTML = html;
+  $("#stopWait") && ($("#stopWait").onclick = (e) => { e.target.disabled = true; api("/bot/cancel", "POST", {}, true).catch(() => {}); });
   $$(".choice", f).forEach((b) => b.onclick = () => {
     if (b.dataset.url) return window.open(b.dataset.url, "_blank");
     const label = b.dataset.label;
     const price = parseAmount(label);
     if (!/annul|cancel|retour|confirm|valider|إلغاء|تأكيد|❌|✅/i.test(label)) {
-      S.rc.sale.description = stripEmoji(label);
-      if (price) { S.rc.sale.total = price; S.rc.sale.paid = price; }
-      renderSalePanel();
+      // an offer or a card picked from the bot's buttons: recorded only once the bot confirms
+      const sim = S.rc.pending?.sim || S.rc.sale.sim || normNum(S.rc.number);
+      S.rc.pending = { kind: S.rc.flow === "card" ? "card" : "offer", total: price || S.rc.pending?.total || "", sim };
     }
     talk(() => api("/bot/click", "POST", { msg_id: +b.dataset.msg, row: +b.dataset.r, col: +b.dataset.c }), stripEmoji(label));
   });
@@ -472,9 +546,9 @@ function renderClientBox() {
     if (S.reveal) S.revealTimer = setTimeout(() => { S.reveal = false; renderClientBox(); }, 8000); });
 }
 
-function freshSale() { return { description: "", total: "", paid: "", client: null, sim: "" }; }
+function freshSale() { return { kind: "", total: "", paid: "", client: null, sim: "" }; }
 function resetOperation() {
-  Object.assign(S.rc, { number: "", amount: "", feed: [], batch: [], pending: null, lastText: "", sale: freshSale(), clientInfo: null, autoClient: false });
+  Object.assign(S.rc, { number: "", amount: "", feed: [], batch: [], pending: null, flow: "", lastText: "", sale: freshSale(), clientInfo: null, autoClient: false });
 }
 
 function renderSalePanel(flash) {
@@ -486,7 +560,8 @@ function renderSalePanel(flash) {
   const offerAttach = s.client && sim.length === 10 && opOf(sim) && !linked;
   p.innerHTML = `
     <h2>${t("record_sale")}</h2>
-    <div class="field"><label>${t("description")}</label><input class="input" id="sDesc" value="${esc(s.description)}"></div>
+    <div class="field"><label>${t("sale_type")}</label>
+      <div class="kind-seg" id="sKind">${SALE_KINDS.map((k) => `<button type="button" data-k="${k}" class="${s.kind === k ? "on" : ""}">${t("kind_" + k)}</button>`).join("")}</div></div>
     <div class="row">
       <div class="field"><label>${t("amount")}</label><input class="input num" id="sTotal" inputmode="decimal" value="${esc(s.total)}"></div>
       <div class="field"><label>${t("paid")}</label><input class="input num" id="sPaid" inputmode="decimal" value="${esc(s.paid)}"></div>
@@ -498,8 +573,8 @@ function renderSalePanel(flash) {
     <div class="debt-preview ${rest > 0 ? "has" : ""}"><span>${t("rest")}</span>${money(rest)}</div>
     <button class="btn primary" style="width:100%" id="sSave">${t("save_next")}</button>`;
   if (flash) { p.animate([{ boxShadow: "0 0 0 4px rgba(18,161,80,.35)" }, { boxShadow: "0 0 0 0 transparent" }], { duration: 1400 }); }
-  const sync = () => { s.description = $("#sDesc").value; s.total = $("#sTotal").value; s.paid = $("#sPaid").value; };
-  $("#sDesc").oninput = sync;
+  const sync = () => { s.total = $("#sTotal").value; s.paid = $("#sPaid").value; };
+  $$("#sKind button", p).forEach((b) => b.onclick = () => { s.kind = b.dataset.k; $$("#sKind button", p).forEach((x) => x.classList.toggle("on", x === b)); });
   $("#sTotal").oninput = () => { const old = s.total; sync(); if (String(s.paid) === String(old) || s.paid === "") { s.paid = s.total; $("#sPaid").value = s.total; } updRest(); };
   $("#sPaid").oninput = () => { sync(); updRest(); };
   const updRest = () => { const rr = saleRest(); const d = $(".debt-preview", p); d.className = "debt-preview " + (rr > 0 ? "has" : ""); d.lastElementChild.outerHTML = money(rr); renderClientBox(); };
@@ -513,13 +588,14 @@ function renderSalePanel(flash) {
   });
   $("#sSave").onclick = async () => {
     sync();
+    if (!s.kind) { $("#sKind").animate([{ transform: "translateX(-4px)" }, { transform: "translateX(4px)" }, { transform: "none" }], { duration: 250 }); return toast(t("err_kind_required"), "err"); }
     if (!(Number(s.total) > 0)) return toast(t("err_invalid_amount"), "err");
     const st = creditStatus(r.clientInfo && s.client && r.clientInfo.id === s.client.id ? r.clientInfo : null, saleRest());
     if (st && st.cls === "red" && !confirm(t("limit_confirm"))) return;
     const btn = $("#sSave"); btn.disabled = true;
     try {
       await api("/sales", "POST", {
-        total: s.total, paid: s.paid === "" ? s.total : s.paid, client_id: s.client?.id, description: s.description,
+        total: s.total, paid: s.paid === "" ? s.total : s.paid, client_id: s.client?.id, kind: s.kind, description: KIND_STORED[s.kind],
         sim_number: sim, bot_reply: r.lastText,
         attach_number: !!(offerAttach && s.attach !== false), number_label: s.label || "",
       });
@@ -576,7 +652,7 @@ async function loadToday() {
 function saleItem(s) {
   const debt = s.total - s.paid;
   const who = isMgr() ? `${esc(s.client_name || t("walkin_short"))}${s.by_name ? ` · ${esc(s.by_name)}` : ""}` : (s.client_id ? t("client") : t("walkin_short"));
-  return `<div class="item"><div class="grow"><div class="t">${esc(s.description || s.kind || t("sale"))}</div>
+  return `<div class="item"><div class="grow"><div class="t">${esc(kindLabel(s))}${s.operator ? ` <span class="sub">${esc(s.operator)}</span>` : ""}</div>
     <div class="s"><span class="num">${esc(isMgr() ? s.sim_number : maskNum(s.sim_number))}</span> · ${who} · ${hm(s.ts)}</div></div>
     <div style="text-align:end">${money(s.total)}${debt > 0.001 ? `<div><span class="pill red">${secret(money(debt))}</span></div>` : ""}</div></div>`;
 }
@@ -747,7 +823,7 @@ async function openStatement(id, onChange, f) {
         ${st.lines.length ? st.lines.map((l) => l.type === "payment"
           ? `<tr class="pay-row"><td class="num">${dmyFull(l.day)} ${hm(l.ts)}</td><td>—</td><td><span class="pill green">${t("payment")}</span> ${esc(l.description)}</td><td class="r"></td><td class="r amt-in">${money(l.credit)}</td><td class="r">${money(l.balance)}</td></tr>`
           : `<tr><td class="num">${dmyFull(l.day)} ${hm(l.ts)}</td><td><i class="opdot op-${l.operator}"></i><span class="num">${esc(l.number || "—")}</span>${l.label ? `<div class="sub">${esc(l.label)}</div>` : ""}</td>
-              <td>${esc(l.description || t("sale"))}</td><td class="r">${money(l.debit)}</td><td class="r">${money(l.credit)}</td>
+              <td>${esc(kindLabel(l))}</td><td class="r">${money(l.debit)}</td><td class="r">${money(l.credit)}</td>
               <td class="r ${l.debit - l.credit > 0.001 ? "amt-out" : ""}">${money(st.by_line ? l.debit - l.credit : l.balance)}</td></tr>`).join("")
           : `<tr><td colspan="6" class="empty">${t("nothing")}</td></tr>`}
       </tbody>
@@ -1122,7 +1198,7 @@ function renderAuth(a) {
   }
 }
 
-const BRIDGE_API_NEEDED = 2;
+const BRIDGE_API_NEEDED = 3;
 async function checkBridgeVersion() {
   try {
     const p = await api("/ping", "GET", null, true);

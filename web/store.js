@@ -326,7 +326,7 @@ async function addSale(b) {
     const sref = F.doc(col("sales"));
     const ts = nowIso(), day = today();
     tx.set(sref, { day, ts, client_id: cid, client_name: c ? c.data().name : "", sim_number: sim, operator: operatorOf(sim),
-                   description: b.description || "", total, paid, rest, bot_reply: String(b.bot_reply || "").slice(0, 1500), ...byMe() });
+                   kind: b.kind || "", description: b.description || "", total, paid, rest, bot_reply: String(b.bot_reply || "").slice(0, 1500), ...byMe() });
     if (c) {
       const d = c.data();
       const upd = { debt: n((d.debt || 0) + rest), last_sale: ts };
@@ -336,7 +336,7 @@ async function addSale(b) {
         tx.set(ref("numbers", sim), { client_id: cid, label: b.number_label || "" });
       }
       tx.update(cref, upd);
-      tx.set(F.doc(col("clients", cid, "entries")), { type: "sale", ref_id: sref.id, day, ts, number: sim, description: b.description || "", debit: total, credit: paid, ...byMe() });
+      tx.set(F.doc(col("clients", cid, "entries")), { type: "sale", ref_id: sref.id, day, ts, number: sim, kind: b.kind || "", description: b.description || "", debit: total, credit: paid, ...byMe() });
     }
     const totals = moveIn(tx, rref, reg, "in", "sale", paid, [b.description, sim].filter(Boolean).join(" "), "sale", sref.id);
     tx.update(rref, { ...totals, sales_count: (reg.sales_count || 0) + 1, sales_total: n((reg.sales_total || 0) + total), new_debt: n((reg.new_debt || 0) + rest) });

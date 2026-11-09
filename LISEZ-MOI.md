@@ -16,6 +16,13 @@ Les données sont dans Firebase : tous les PC et téléphones de la boutique voi
 2. **Recharge** : numéro → l'opérateur et le client sont reconnus → Flexy / Facture / International / Offres → montant
    → **Envoyer**. Un grand écran montre le numéro au client : **Confirmer et envoyer** (Entrée) ou **Corriger** (Échap).
    La réponse du bot s'affiche, puis **Enregistrer et opération suivante** (le reste non payé devient une dette).
+   La réponse du bot est lue automatiquement. En cas de problème, une fenêtre l'explique : **Solde insuffisant**,
+   **Aucune offre pour cette SIM**, **Numéro refusé**, **Opération non effectuée**, **Toujours en cours** ou
+   **Pas de réponse du bot**. Dans ces cas rien n'est enregistré. Pendant l'attente, un compteur s'affiche et le bouton
+   **Arrêter** coupe l'attente. Avant de renvoyer après « Pas de réponse » ou « En cours », utilisez **Vérifier à nouveau**
+   pour ne pas envoyer deux fois.
+   Le **type d'opération** de la vente (Flexy, Offre / abonnement, Facture, International, Carte) est choisi
+   automatiquement ; il n'y a plus de description libre.
 3. Sur l'écran de l'opérateur, les dettes et limites sont masquées (•••••) : l'œil les affiche 8 secondes.
    Les autres numéros du client sont masqués et le solde du fournisseur n'apparaît jamais.
 4. **Clients → Relevé → Encaisser** quand un client rembourse (l'argent entre dans la caisse du jour).
@@ -37,6 +44,10 @@ Les données sont dans Firebase : tous les PC et téléphones de la boutique voi
 | Facture | Djezzy | `0772415263**2500` |
 | Facture | Ooredoo (05 → 01) | `0150569874*2500` |
 | Offres / ماكتيفيا | tous | `0669970022` |
+
+## Mode démo (pour s'entraîner)
+Le bot de démo réagit selon les 2 derniers chiffres du numéro : `…00` ne répond pas, `…11` (offres) n'a aucune offre,
+`…22` échoue, `…33` numéro refusé ; un montant supérieur au solde donne « Solde insuffisant ».
 
 ## À savoir
 - Le PC du bot doit rester allumé avec la fenêtre SIM Desk ouverte. Son dossier `data/` contient la session
